@@ -1,0 +1,12 @@
+.DS_Store
+.env
+.env.*
+.pytest_cache/
+.venv/
+__pycache__/
+*.py[cod]
+dist/
+generated/
+rollback/
+runtime/
+*.zip

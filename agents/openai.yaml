@@ -1,0 +1,7 @@
+interface:
+  display_name: "皓月3D建模提示词"
+  short_description: "皓月双图需求解析、布局保真、灰色背景与建模提示词审查"
+  default_prompt: "使用 $haoyue-3d-concept 解析我上传的皓月项目需求图，输出经图文对照审查的纯净3D建模提示词，不生图。"
+
+policy:
+  allow_implicit_invocation: true

@@ -1,0 +1,18 @@
+services:
+  haoyue-3d-web:
+    build:
+      context: .
+    container_name: haoyue-3d-web
+    env_file:
+      - .env
+    ports:
+      - "${WEB_PORT:-9985}:8000"
+    volumes:
+      - ./config:/app/config:ro
+      - generated-data:/app/generated
+      - runtime-data:/app/runtime
+    restart: unless-stopped
+
+volumes:
+  generated-data:
+  runtime-data:
