@@ -523,6 +523,17 @@ async def resume_image(job_id: str) -> dict[str, object]:
     return record.public()
 
 
+@app.post("/api/jobs/{job_id}/image/audit", status_code=202)
+async def review_image(job_id: str) -> dict[str, object]:
+    try:
+        record = manager.review_image(job_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="任务不存在或已经过期。") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return record.public()
+
+
 @app.delete("/api/jobs/{job_id}", status_code=204)
 async def cancel_job(job_id: str) -> None:
     try:

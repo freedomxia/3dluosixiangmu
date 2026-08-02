@@ -82,6 +82,7 @@ const elements = {
   imageEmptyText: document.querySelector("#imageEmptyText"),
   imageResumeButton: document.querySelector("#imageResumeButton"),
   imageRegeneration: document.querySelector("#imageRegeneration"),
+  reviewImageButton: document.querySelector("#reviewImageButton"),
   regenerateImageButton: document.querySelector("#regenerateImageButton"),
   promptApproval: document.querySelector("#promptApproval"),
   promptApprovalText: document.querySelector("#promptApprovalText"),
@@ -146,8 +147,11 @@ const statusStage = {
   composing: "composing",
   validating: "validating",
   repairing: "validating",
+  semantic_review: "validating",
+  semantic_repair: "validating",
   prompt_ready: "review_prompt",
   generating_image: "generating_image",
+  reviewing_image: "generating_image",
   needs_input: "analyzing",
   complete: "generating_image",
 };
@@ -157,7 +161,10 @@ const pollingStatuses = new Set([
   "composing",
   "validating",
   "repairing",
+  "semantic_review",
+  "semantic_repair",
   "generating_image",
+  "reviewing_image",
 ]);
 const terminalStatuses = new Set(["prompt_ready", "complete", "failed"]);
 
@@ -314,6 +321,7 @@ function bindEvents() {
   elements.generateImageButton.addEventListener("click", generateImage);
   elements.regeneratePromptButton.addEventListener("click", regeneratePrompt);
   elements.regenerateImageButton.addEventListener("click", regenerateImage);
+  elements.reviewImageButton.addEventListener("click", reviewImage);
   elements.imageResumeButton.addEventListener("click", resumeImage);
   elements.newTaskButton.addEventListener("click", requestNewTask);
   elements.downloadButton.addEventListener("click", downloadResult);
@@ -459,9 +467,12 @@ function renderHistory(items) {
     composing: "生成提示词",
     validating: "审查中",
     repairing: "修正中",
+    semantic_review: "语义复查",
+    semantic_repair: "语义修正",
     needs_input: "待补充",
     prompt_ready: "待确认",
     generating_image: "生图中",
+    reviewing_image: "结果复查",
     complete: "已完成",
     failed: "未完成",
   };
@@ -1183,7 +1194,7 @@ function applyJob(job) {
     return;
   }
 
-  if (job.status === "generating_image" && job.result) {
+  if (["generating_image", "reviewing_image"].includes(job.status) && job.result) {
     rememberImageTask(job.id);
     renderResult(job.result, {
       final: false,
@@ -1491,6 +1502,32 @@ async function resumeImage() {
   }
 }
 
+async function reviewImage() {
+  const jobId = state.selectedJobId;
+  if (!jobId || state.runningJobIds.has(jobId)) return;
+  elements.reviewImageButton.disabled = true;
+  elements.reviewImageButton.textContent = "正在重新复查";
+  setInputLocked(true);
+  updateSubmitState();
+  try {
+    const response = await fetch(`/api/jobs/${jobId}/image/audit`, {
+      method: "POST",
+    });
+    const data = await readJson(response);
+    if (!response.ok) throw new Error(getErrorMessage(data));
+    state.runningJobIds.add(jobId);
+    applyJob(data);
+    activateResultTab("image");
+    schedulePoll();
+    scheduleStallNotice();
+  } catch (error) {
+    state.runningJobIds.delete(jobId);
+    elements.reviewImageButton.disabled = false;
+    elements.reviewImageButton.textContent = "重新复查已有图片";
+    showToast(error.message || "无法重新复查结果图。");
+  }
+}
+
 function renderResult(result, options = {}) {
   const task = selectedTask();
   const final = options.final !== false;
@@ -1521,14 +1558,18 @@ function renderResult(result, options = {}) {
   }
   if (task && !task.resultRendered) task.resultHandled = false;
   const image = result.image || {};
+  const requirementAudit = image.requirement_audit || {};
   const generatedUrls = getSafeGeneratedImageUrls(image);
   renderGeneratedImages(generatedUrls, image.alt);
   if (generatedUrls.length) {
     elements.imageEmpty.hidden = true;
     elements.imageResumeButton.hidden = true;
     elements.resultTabImage.textContent = `结果图 · ${generatedUrls.length} 张`;
-    elements.imageCaption.textContent =
-      `结果图 · ${generatedUrls.length} 张已与当前任务提示词关联`;
+    elements.imageCaption.textContent = requirementAudit.pass === true
+      ? `结果图 · ${generatedUrls.length} 张已保留；PixPark 平台审核与需求符合度复查已分开通过`
+      : requirementAudit.pass === false
+        ? `结果图 · ${generatedUrls.length} 张已保留；平台审核通过，需求符合度需修改：${requirementAudit.summary || "请查看复查结论"}`
+        : `结果图 · ${generatedUrls.length} 张已与当前任务提示词关联；需求符合度复查${requirementAudit.status === "reviewing" ? "中" : "未完成"}`;
   } else {
     elements.imageEmpty.hidden = false;
     renderImageStatus(image);
@@ -1559,6 +1600,10 @@ function renderResult(result, options = {}) {
     generatedUrls.length > 0 &&
     !image.resumable;
   elements.imageRegeneration.hidden = !canRegenerateImage;
+  elements.reviewImageButton.hidden =
+    !canRegenerateImage || requirementAudit.status !== "unavailable";
+  elements.reviewImageButton.disabled = false;
+  elements.reviewImageButton.textContent = "重新复查已有图片";
   elements.imageResult.classList.toggle(
     "has-regeneration",
     canRegenerateImage,
@@ -1571,10 +1616,16 @@ function renderResult(result, options = {}) {
   });
   elements.positivePrompt.textContent = result.positive_prompt || "未提取到正向提示词。";
   elements.negativePrompt.textContent = result.negative_prompt || "未提取到负面提示词。";
-  elements.auditSummary.textContent =
-    result.repair_attempts > 0
-      ? `经过 ${result.repair_attempts} 次自动修正后，结构规则已通过；内容仍需人工核对。`
-      : "已检查图号、复制区、背景硬句和内部字段；内容仍需人工核对。";
+  const mechanicalPass = result.mechanical_validation?.pass === true;
+  const semanticStatus = result.semantic_audit?.status;
+  const repairCopy = result.repair_attempts > 0
+    ? `经过 ${result.repair_attempts} 次自动修正；`
+    : "";
+  elements.auditSummary.textContent = semanticStatus === "passed"
+    ? `${repairCopy}机械校验${mechanicalPass ? "通过" : "未通过"}，独立语义审查通过；仍建议人工核对最终取舍。`
+    : semanticStatus === "disabled"
+      ? `${repairCopy}机械校验${mechanicalPass ? "通过" : "未通过"}；独立语义审查已关闭。`
+      : `${repairCopy}机械校验${mechanicalPass ? "通过" : "未通过"}；独立语义审查状态：${semanticStatus || "旧任务无记录"}。`;
 
   renderDetails(result.sections || {});
   elements.promptResults.hidden = false;
@@ -1586,9 +1637,11 @@ function renderResult(result, options = {}) {
     recoveredImageOnly
       ? "仅恢复到旧版远端图片任务；新的完整任务会在临时保留期内恢复需求图和提示词。"
       : promptReady
-        ? "结构规则检查已通过；先看提示词，确认满意后一次生成 4 张。"
+        ? "机械校验与独立语义审查均已通过；先看提示词，确认满意后一次生成 4 张。"
         : final
-          ? `提示词与 ${generatedUrls.length || 0} 张结果图已经关联；可继续查看或复制。`
+          ? requirementAudit.pass === false
+            ? `图片已保留；PixPark 平台审核通过，但需求符合度复查需修改。`
+            : `提示词与 ${generatedUrls.length || 0} 张结果图已经关联；可继续查看或复制。`
           : "提示词已经锁定；正在生成关联的 4 张结果图，不会重新解析需求。";
   elements.resultStation.classList.add("complete");
   if (!task?.resultRendered) {
@@ -1920,6 +1973,9 @@ function resetTask(options = {}) {
   elements.imageRegeneration.hidden = true;
   elements.regeneratePromptButton.disabled = false;
   elements.regenerateImageButton.disabled = false;
+  elements.reviewImageButton.hidden = true;
+  elements.reviewImageButton.disabled = false;
+  elements.reviewImageButton.textContent = "重新复查已有图片";
   elements.generateImageButton.hidden = false;
   elements.generateImageButton.disabled = false;
   elements.generateImageButton.textContent = "确认提示词，一次生成 4 张";
@@ -1971,6 +2027,7 @@ function prepareResultForProcessing() {
   elements.reviewContext.hidden = true;
   elements.promptApproval.hidden = true;
   elements.imageRegeneration.hidden = true;
+  elements.reviewImageButton.hidden = true;
   elements.imageResult.classList.remove("has-regeneration");
   elements.promptResults.hidden = false;
   elements.positivePrompt.textContent =

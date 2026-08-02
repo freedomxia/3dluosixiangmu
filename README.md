@@ -78,12 +78,13 @@ https://api.example.com/v1
 https://api.example.com/v1/chat/completions
 ```
 
-后台采用两段式流程：
+后台采用三段式提示词流程：
 
 1. 用图1判断任务类型、专项规则和是否需要一次补充确认。
 2. 自动读取当前 Skill 及适用 reference，把图1与固定图2一并提交，生成正式结果。
+3. 先执行确定性机械校验，再用一次独立视觉模型调用重新查看双图和完整草稿，检查创意事件、动作可达、布局权限、聚拢、红线删除和局部参考范围；不接受草稿自报的 `PASS`。
 
-生成结果随后由 `scripts/validate_output.py` 的同一套逻辑检查；失败时最多自动修正 `REPAIR_ATTEMPTS` 次。
+任一检查失败时，结构化错误会送回模型修正，最多自动修正 `REPAIR_ATTEMPTS` 次，修正后必须重新执行两类审查。`SEMANTIC_AUDIT_ENABLED=false` 可紧急回退到旧的机械校验链，但默认开启。
 
 “丰富趣味”默认关闭。关闭时仍执行上述完整流程和任务类型本身允许的正常创意；开启时只在文字识别、需求终态、主体锁和布局权限完成后，追加一个主创意、2–3 个关联功能模块和受控因果细节，不能覆盖图1硬要求，也不能靠散落小道具制造虚假丰富。
 
@@ -103,6 +104,8 @@ PIX_PARK_TOKEN=replace-with-your-token
 当前 PixPark 接口参数固定为 version 3、1:1、4K、4 张图、关闭 Google Search。一次点击只创建一个 PixPark 任务并请求 4 张结果，不会由浏览器重复提交四次。接口比例不会被写成提示词中的“生成1:1”标志；若用户明确要求其他画幅，网站保留提示词结果并禁用生图确认，避免静默改画幅。
 
 PixPark `taskCode` 会在第一次查询前原子写入 `generated/pixpark-state/`。等待超时后，结果区可继续查询同一任务，不会重复提交。浏览器会在当前会话中仅记住非敏感的本地任务编号；即使网站进程重启，也能从状态文件恢复“继续查询原任务”入口。恢复模式不持久化用户原图、提示词或预签名地址。只有 `imageAuditStatus === true` 且结果地址非空时才会保存并展示图片。最多按返回顺序保存 4 张；若服务只返回部分审核通过的结果，会保留可用图片并明确显示实际数量。
+
+图片保存后，默认再用独立视觉调用对照图1和已审查正向提示词，逐张给出需求符合度结论。审查只使用不超过 1536 像素的 JPEG 临时副本，原始 4K 图片保持不变，避免多图视觉请求超过网关大小限制。页面将“PixPark 平台审核”和“需求符合度复查”分开显示；后者失败时图片仍保留并标记“需修改”，不会自动重新生图或再次扣费。审查服务暂时不可用时，可点击“重新复查已有图片”，只重试视觉审查而不创建新的 Pix 任务。可用 `POST_IMAGE_AUDIT_ENABLED=false` 关闭该复查。
 
 ## 数据与进程约束
 
@@ -152,8 +155,15 @@ uvicorn webapp.app:app --reload
   "expected_count": 4,
   "alt": "本任务后续生成的 3D 建模参考结果组图",
   "message": "4 张结果图已生成并通过 PixPark 审核。",
-  "resumable": false
+  "resumable": false,
+  "platform_audit": {"status": "passed", "pass": true},
+  "requirement_audit": {
+    "status": "passed",
+    "pass": true,
+    "per_image": [{"index": 1, "pass": true, "errors": []}],
+    "best_indices": [1]
+  }
 }
 ```
 
-常见状态包括 `ready`、`uploading`、`creating`、`polling`、`downloading`、`completed`、`partial`、`timeout`、`rejected`、`failed`、`disabled`、`unavailable` 和 `incompatible_aspect_ratio`。`ready` 表示提示词已审查完成、等待用户确认生图；生成成功时 `urls` 返回同源结果图列表，`url` 保留为首张图的兼容字段。
+常见状态包括 `ready`、`uploading`、`creating`、`polling`、`downloading`、`completed`、`partial`、`needs_revision`、`timeout`、`rejected`、`failed`、`disabled`、`unavailable` 和 `incompatible_aspect_ratio`。`ready` 表示提示词已审查完成、等待用户确认生图；`needs_revision` 表示图片已通过平台审核并被保留，但需求符合度复查没有通过；生成成功时 `urls` 返回同源结果图列表，`url` 保留为首张图的兼容字段。

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import mimetypes
@@ -13,6 +14,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
+
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 from scripts.validate_output import validate_document
 from webapp.config import Settings
@@ -34,6 +37,7 @@ from webapp.pixpark_client import (
     PixParkStateStore,
     PixParkTimeout,
 )
+from webapp.semantic_audit import audit_generated_images, audit_prompt
 from webapp.skill_loader import SkillSourceError, build_skill_prompt
 
 CLASSIFIER_PROMPT = """
@@ -82,7 +86,10 @@ ACTIVE_STATUSES = {
     "composing",
     "validating",
     "repairing",
+    "semantic_review",
+    "semantic_repair",
     "generating_image",
+    "reviewing_image",
     "needs_input",
 }
 
@@ -276,10 +283,20 @@ class JobFileStore:
 
         status = str(payload.get("status") or "failed")
         recovery_action = None
-        if status in {"queued", "analyzing", "composing", "validating", "repairing"}:
+        if status in {
+            "queued",
+            "analyzing",
+            "composing",
+            "validating",
+            "repairing",
+            "semantic_review",
+            "semantic_repair",
+        }:
             recovery_action = "model"
         elif status == "generating_image":
             recovery_action = "image"
+        elif status == "reviewing_image":
+            recovery_action = "review"
 
         classification = payload.get("classification")
         result = payload.get("result")
@@ -518,6 +535,33 @@ class JobManager:
                         resumable=False,
                     )
                     self._complete(record)
+            elif action == "review":
+                filenames = self._saved_image_filenames(record)
+                if filenames and record.image_bytes:
+                    self._update(
+                        record,
+                        status="reviewing_image",
+                        step="恢复结果图复查",
+                        message="服务已恢复，正在继续复查本地结果图，不会重新调用 PixPark。",
+                        error=None,
+                    )
+                    record.task = asyncio.create_task(
+                        self._run_image_review(record, filenames)
+                    )
+                else:
+                    self._update_image(
+                        record,
+                        requirement_audit={
+                            "status": "unavailable",
+                            "pass": None,
+                            "errors": [],
+                            "warnings": [],
+                            "summary": "服务恢复后缺少本地审查输入，请手动重新复查。",
+                            "per_image": [],
+                            "best_indices": [],
+                        },
+                    )
+                    self._complete(record)
 
     def get(self, job_id: str) -> JobRecord | None:
         self._cleanup()
@@ -730,6 +774,32 @@ class JobManager:
         record.task = asyncio.create_task(self._run_image_generation(record))
         return record
 
+    def review_image(self, job_id: str) -> JobRecord:
+        record = self.get(job_id)
+        if record is None:
+            raise KeyError(job_id)
+        if record.task and not record.task.done():
+            raise ValueError("当前任务仍在处理中。")
+        if not self.settings.post_image_audit_enabled:
+            raise ValueError("结果图需求符合度审查当前未启用。")
+        if record.status != "complete":
+            raise ValueError("当前任务还不能重新复查结果图。")
+        filenames = self._saved_image_filenames(record)
+        if not filenames:
+            raise ValueError("当前任务没有可复查的本地结果图。")
+
+        self._update(
+            record,
+            status="reviewing_image",
+            step="重新复查结果图",
+            message="正在压缩审查副本并逐张对照需求，不会重新调用 PixPark。",
+            error=None,
+        )
+        record.task = asyncio.create_task(
+            self._run_image_review(record, filenames)
+        )
+        return record
+
     def _discard_previous_image_task(self, job_id: str) -> None:
         PixParkStateStore(
             self.settings.generated_dir / "pixpark-state"
@@ -932,6 +1002,8 @@ class JobManager:
 
         attempts = 0
         validation: dict[str, Any]
+        mechanical_validation: dict[str, Any]
+        semantic_audit: dict[str, Any]
         while True:
             self._update(
                 record,
@@ -939,26 +1011,71 @@ class JobManager:
                 step="审查输出",
                 message="正在检查图号、复制区、灰色背景和内部字段。",
             )
-            validation = validate_document(
+            mechanical_validation = validate_document(
                 draft,
                 require_negative=True,
                 allow_aspect_ratio=bool(classification["allow_aspect_ratio"]),
                 anniversary_source=classification["anniversary_source"],
+                task_type=str(classification["task_type"]),
+                enrichment_enabled=record.enrichment_enabled,
+            )
+            if mechanical_validation["pass"] and self.settings.semantic_audit_enabled:
+                self._update(
+                    record,
+                    status="semantic_review",
+                    step="独立语义审查",
+                    message="正在重新查看双图，检查创意事件、动作可达、聚拢和局部参考范围。",
+                )
+                semantic_audit = await audit_prompt(
+                    self.client,
+                    classification=classification,
+                    enrichment_enabled=record.enrichment_enabled,
+                    note=record.note,
+                    draft=draft,
+                    images=images,
+                )
+            elif self.settings.semantic_audit_enabled:
+                semantic_audit = {
+                    "status": "pending",
+                    "pass": False,
+                    "errors": [],
+                    "warnings": [],
+                    "summary": "机械校验未通过，语义审查将在修正后执行。",
+                    "checks": {},
+                }
+            else:
+                semantic_audit = {
+                    "status": "disabled",
+                    "pass": True,
+                    "errors": [],
+                    "warnings": [],
+                    "summary": "独立语义审查已由部署配置关闭。",
+                    "checks": {},
+                }
+            validation = _combine_prompt_validations(
+                mechanical_validation,
+                semantic_audit,
             )
             if validation["pass"] or attempts >= self.settings.repair_attempts:
                 break
 
             attempts += 1
+            semantic_failed = bool(semantic_audit.get("errors"))
             self._update(
                 record,
-                status="repairing",
+                status="semantic_repair" if semantic_failed else "repairing",
                 step="自动修正",
-                message=f"发现机械门禁问题，正在进行第 {attempts} 次修正。",
+                message=(
+                    f"发现语义门禁问题，正在进行第 {attempts} 次修正。"
+                    if semantic_failed
+                    else f"发现机械门禁问题，正在进行第 {attempts} 次修正。"
+                ),
             )
             repair_text = (
-                "上一版交付没有通过机械校验。重新查看图1和图2，"
+                "上一版交付没有通过独立审查。重新查看图1和图2，"
                 "保持已经正确的需求终态，只修复列出的错误，然后重新输出完整最终 Markdown。\n"
-                f"校验错误：{json.dumps(validation['errors'], ensure_ascii=False)}\n\n"
+                f"机械校验：{json.dumps(mechanical_validation, ensure_ascii=False)}\n"
+                f"独立语义审查：{json.dumps(semantic_audit, ensure_ascii=False)}\n\n"
                 f"上一版交付：\n{draft}"
             )
             draft = await self.client.complete(
@@ -969,6 +1086,32 @@ class JobManager:
             )
 
         if not validation["pass"]:
+            failed_sections = parse_markdown_sections(draft)
+            record.result = {
+                "markdown": draft,
+                "positive_prompt": strip_single_code_fence(
+                    failed_sections.get("纯净生图提示词复制区", "")
+                ),
+                "negative_prompt": strip_single_code_fence(
+                    failed_sections.get("纯净负面提示词复制区", "")
+                ),
+                "sections": failed_sections,
+                "validation": validation,
+                "mechanical_validation": mechanical_validation,
+                "semantic_audit": semantic_audit,
+                "repair_attempts": attempts,
+                "delivery_status": "blocked",
+                "image": {
+                    "status": "blocked",
+                    "url": None,
+                    "urls": [],
+                    "count": 0,
+                    "expected_count": RESULT_IMAGE_COUNT,
+                    "message": "提示词未通过独立审查，未提交 PixPark。",
+                    "resumable": False,
+                },
+            }
+            self._persist(record)
             raise ValueError(
                 "模型输出在自动修正后仍未通过校验："
                 + "；".join(str(item) for item in validation["errors"])
@@ -988,6 +1131,8 @@ class JobManager:
             "negative_prompt": negative,
             "sections": sections,
             "validation": validation,
+            "mechanical_validation": mechanical_validation,
+            "semantic_audit": semantic_audit,
             "repair_attempts": attempts,
             "image": {
                 "status": self._initial_image_status(classification),
@@ -1063,7 +1208,8 @@ class JobManager:
                         record, status, message
                     ),
                 )
-            self._apply_image_result(record, result)
+            filenames = self._apply_image_result(record, result)
+            await self._review_generated_images(record, filenames)
         except PixParkTimeout as exc:
             self._update_image(
                 record,
@@ -1112,7 +1258,8 @@ class JobManager:
                         record, status, message
                     ),
                 )
-            self._apply_image_result(record, result)
+            filenames = self._apply_image_result(record, result)
+            await self._review_generated_images(record, filenames)
         except asyncio.CancelledError:
             return
         except PixParkTimeout as exc:
@@ -1155,6 +1302,17 @@ class JobManager:
             self._complete(record)
             record.task = None
 
+    async def _run_image_review(
+        self,
+        record: JobRecord,
+        filenames: tuple[str, ...],
+    ) -> None:
+        try:
+            await self._review_generated_images(record, filenames)
+        finally:
+            self._complete(record)
+            record.task = None
+
     def _image_progress(
         self,
         record: JobRecord,
@@ -1178,7 +1336,7 @@ class JobManager:
         self,
         record: JobRecord,
         result: Any,
-    ) -> None:
+    ) -> tuple[str, ...]:
         filenames = tuple(
             name
             for name in getattr(result, "filenames", ())
@@ -1208,7 +1366,128 @@ class JobManager:
             expected_count=RESULT_IMAGE_COUNT,
             message=message,
             resumable=False,
+            platform_audit={
+                "status": "passed",
+                "pass": True,
+                "summary": message,
+            },
         )
+        return filenames
+
+    async def _review_generated_images(
+        self,
+        record: JobRecord,
+        filenames: tuple[str, ...],
+    ) -> None:
+        if not self.settings.post_image_audit_enabled:
+            self._update_image(
+                record,
+                requirement_audit={
+                    "status": "disabled",
+                    "pass": None,
+                    "errors": [],
+                    "warnings": [],
+                    "summary": "结果图需求符合度审查已由部署配置关闭。",
+                    "per_image": [],
+                    "best_indices": [],
+                },
+            )
+            return
+
+        self._update(
+            record,
+            status="reviewing_image",
+            step="复查结果图",
+            message="PixPark 平台审核已完成，正在逐张对照需求终态。",
+        )
+        self._update_image(
+            record,
+            requirement_audit={
+                "status": "reviewing",
+                "pass": None,
+                "errors": [],
+                "warnings": [],
+                "summary": "正在执行需求符合度审查。",
+                "per_image": [],
+                "best_indices": [],
+            },
+        )
+        try:
+            generated_images = [
+                _read_generated_image(self.settings.generated_dir, filename)
+                for filename in filenames
+            ]
+            async with self.model_semaphore:
+                review = await audit_generated_images(
+                    self.client,
+                    positive_prompt=str(
+                        (record.result or {}).get("positive_prompt") or ""
+                    ),
+                    note=record.note,
+                    source_image=_prepare_audit_image(
+                        record.image_bytes,
+                        record.media_type,
+                        max_dimension=1600,
+                    ),
+                    generated_images=generated_images,
+                )
+        except (ModelAPIError, ValueError, OSError):
+            logger.warning("结果图需求符合度审查不可用", exc_info=True)
+            self._update_image(
+                record,
+                requirement_audit={
+                    "status": "unavailable",
+                    "pass": None,
+                    "errors": [],
+                    "warnings": [],
+                    "summary": "结果图已保留，但本次需求符合度审查暂时不可用。",
+                    "per_image": [],
+                    "best_indices": [],
+                },
+            )
+            return
+
+        self._update_image(record, requirement_audit=review)
+        if review["pass"]:
+            count = len(filenames)
+            status = "completed" if count >= RESULT_IMAGE_COUNT else "partial"
+            self._update_image(
+                record,
+                status=status,
+                message=(
+                    f"PixPark 返回 {count}/{RESULT_IMAGE_COUNT} 张平台审核通过结果；"
+                    "需求符合度复查至少有一张通过。"
+                ),
+            )
+        else:
+            self._update_image(
+                record,
+                status="needs_revision",
+                message=(
+                    "结果图已通过 PixPark 平台审核，但需求符合度复查发现需修改项："
+                    f"{review['summary']}"
+                ),
+            )
+
+    def _saved_image_filenames(self, record: JobRecord) -> tuple[str, ...]:
+        image = (record.result or {}).get("image")
+        if not isinstance(image, dict):
+            return ()
+        urls = image.get("urls")
+        if not isinstance(urls, list):
+            return ()
+        filenames: list[str] = []
+        for url in urls:
+            if not isinstance(url, str) or not url.startswith("/generated/"):
+                continue
+            filename = url.removeprefix("/generated/")
+            if (
+                Path(filename).name == filename
+                and (self.settings.generated_dir / filename).is_file()
+                and filename not in filenames
+            ):
+                filenames.append(filename)
+        return tuple(filenames[:RESULT_IMAGE_COUNT])
 
     def _update_image(self, record: JobRecord, **values: Any) -> None:
         if record.result is None:
@@ -1222,11 +1501,22 @@ class JobManager:
         self._persist(record)
 
     def _complete(self, record: JobRecord) -> None:
+        image = (record.result or {}).get("image")
+        requirement = image.get("requirement_audit") if isinstance(image, dict) else None
+        if isinstance(requirement, dict) and requirement.get("status") == "failed":
+            step = "结果图需修改"
+            message = "图片已保留；PixPark 平台审核通过，但需求符合度复查未通过。"
+        elif isinstance(requirement, dict) and requirement.get("status") == "passed":
+            step = "结果图复查通过"
+            message = "PixPark 平台审核与需求符合度复查均已完成。"
+        else:
+            step = "结果图已更新"
+            message = "提示词与结果图已经关联到同一个任务。"
         self._update(
             record,
             status="complete",
-            step="结果图已更新",
-            message="提示词与结果图已经关联到同一个任务。",
+            step=step,
+            message=message,
         )
 
     def _complete_prompt(self, record: JobRecord) -> None:
@@ -1234,7 +1524,7 @@ class JobManager:
             record,
             status="prompt_ready",
             step="提示词待确认",
-            message="提示词已通过结构检查；请先核对，确认后再生成结果图。",
+            message="提示词已通过机械校验和独立语义审查；请先核对，确认后再生成结果图。",
         )
 
     def _update(self, record: JobRecord, **values: Any) -> None:
@@ -1288,6 +1578,81 @@ def _read_style_image(path: Path) -> VisionImage:
     if media_type not in {"image/png", "image/jpeg", "image/webp"}:
         raise SkillSourceError("图2风格参考图必须是 PNG、JPEG 或 WebP。")
     return VisionImage(data=data, media_type=media_type)
+
+
+def _read_generated_image(root: Path, filename: str) -> VisionImage:
+    if Path(filename).name != filename:
+        raise OSError("结果图文件名不安全。")
+    path = root / filename
+    media_type = mimetypes.guess_type(path.name)[0] or "image/png"
+    if media_type not in {"image/png", "image/jpeg", "image/webp"}:
+        raise OSError("结果图格式不支持审查。")
+    return _prepare_audit_image(
+        path.read_bytes(),
+        media_type,
+        max_dimension=1536,
+    )
+
+
+def _prepare_audit_image(
+    data: bytes,
+    media_type: str,
+    *,
+    max_dimension: int,
+) -> VisionImage:
+    try:
+        with Image.open(io.BytesIO(data)) as opened:
+            image = ImageOps.exif_transpose(opened)
+            image.thumbnail(
+                (max_dimension, max_dimension),
+                Image.Resampling.LANCZOS,
+            )
+            if image.mode in {"RGBA", "LA"}:
+                rgba = image.convert("RGBA")
+                background = Image.new("RGB", rgba.size, (224, 224, 224))
+                background.paste(rgba, mask=rgba.getchannel("A"))
+                image = background
+            elif image.mode != "RGB":
+                image = image.convert("RGB")
+            output = io.BytesIO()
+            image.save(output, format="JPEG", quality=84, optimize=True)
+    except (OSError, UnidentifiedImageError) as exc:
+        raise OSError(f"无法准备{media_type}审查副本。") from exc
+    return VisionImage(data=output.getvalue(), media_type="image/jpeg")
+
+
+def _combine_prompt_validations(
+    mechanical: dict[str, Any],
+    semantic: dict[str, Any],
+) -> dict[str, Any]:
+    errors = [
+        {"source": "mechanical", "code": "MECHANICAL_GATE", "message": str(item)}
+        for item in mechanical.get("errors", [])
+    ]
+    errors.extend(
+        {
+            "source": "semantic",
+            "code": str(item.get("code") or "SEMANTIC_ERROR"),
+            "message": str(item.get("message") or "语义审查失败"),
+            "evidence": str(item.get("evidence") or ""),
+        }
+        for item in semantic.get("errors", [])
+        if isinstance(item, dict)
+    )
+    warnings = [
+        {"source": "mechanical", "message": str(item)}
+        for item in mechanical.get("warnings", [])
+    ]
+    warnings.extend(
+        {"source": "semantic", **item}
+        for item in semantic.get("warnings", [])
+        if isinstance(item, dict)
+    )
+    return {
+        "pass": bool(mechanical.get("pass")) and bool(semantic.get("pass")),
+        "errors": errors,
+        "warnings": warnings,
+    }
 
 
 def _normalize_classification(value: dict[str, Any]) -> dict[str, Any]:

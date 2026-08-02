@@ -12,6 +12,7 @@ from pathlib import Path
 
 MAIN_TITLE = "纯净生图提示词复制区"
 NEGATIVE_TITLE = "纯净负面提示词复制区"
+CREATIVE_TITLE = "创意方向"
 
 INTERNAL_TOKENS = (
     "TASK_TYPE",
@@ -55,6 +56,20 @@ def extract_code_block(text: str, title: str) -> str | None:
     tail = text[heading.end() :]
     block = re.search(r"```(?:text|markdown)?[ \t]*\n(.*?)\n```", tail, flags=re.DOTALL)
     return block.group(1).strip() if block else None
+
+
+def extract_section(text: str, title: str) -> str | None:
+    heading = re.search(
+        rf"^#{{1,6}}\s*(?:\d+[.)、]\s*)?{re.escape(title)}\s*$",
+        text,
+        flags=re.MULTILINE,
+    )
+    if not heading:
+        return None
+    tail = text[heading.end() :]
+    next_heading = re.search(r"^#{1,6}\s+", tail, flags=re.MULTILINE)
+    end = next_heading.start() if next_heading else len(tail)
+    return tail[:end].strip()
 
 
 def validate_block(
@@ -122,6 +137,8 @@ def validate_document(
     require_negative: bool,
     allow_aspect_ratio: bool,
     anniversary_source: str,
+    task_type: str | None = None,
+    enrichment_enabled: bool = False,
 ) -> dict[str, object]:
     errors: list[str] = []
     warnings: list[str] = []
@@ -166,6 +183,17 @@ def validate_document(
     if main_heading_count > 1:
         warnings.append("检测到多个主提示词复制区标题，请人工确认只交付一个最终版本")
 
+    if enrichment_enabled and task_type != "STRICT_REPLICA":
+        creative = extract_section(text, CREATIVE_TITLE)
+        if creative is None:
+            errors.append("[ENRICHMENT_NA_FORBIDDEN] 丰富趣味开启时缺少“创意方向”章节")
+        else:
+            normalized = re.sub(r"[\s`*_：:。；;，,（）()]", "", creative).upper()
+            if normalized in {"", "N/A", "NA", "不适用", "无"}:
+                errors.append(
+                    "[ENRICHMENT_NA_FORBIDDEN] 丰富趣味开启且非严格复刻时，创意方向不得为 N/A"
+                )
+
     return {
         "pass": not errors,
         "errors": errors,
@@ -188,6 +216,17 @@ def main() -> int:
         "--skip-negative",
         action="store_true",
         help="当前任务明确不需要正式负面提示词时使用",
+    )
+    parser.add_argument(
+        "--task-type",
+        choices=("RECOMPOSE_SCENE", "LOCK_LAYOUT_EDIT", "ASSET", "STRICT_REPLICA"),
+        default=None,
+        help="任务类型；与 --enrichment-enabled 共同启用确定性丰富门禁",
+    )
+    parser.add_argument(
+        "--enrichment-enabled",
+        action="store_true",
+        help="本轮开启丰富趣味",
     )
     parser.add_argument(
         "--allow-aspect-ratio",
@@ -213,6 +252,8 @@ def main() -> int:
             require_negative=not args.skip_negative,
             allow_aspect_ratio=args.allow_aspect_ratio,
             anniversary_source=args.anniversary_source,
+            task_type=args.task_type,
+            enrichment_enabled=args.enrichment_enabled,
         )
 
     if args.json:

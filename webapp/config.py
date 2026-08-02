@@ -129,6 +129,8 @@ class Settings:
     job_ttl_seconds: int
     max_clarification_rounds: int
     repair_attempts: int
+    semantic_audit_enabled: bool
+    post_image_audit_enabled: bool
     image_generation_enabled: bool
     max_concurrent_image_jobs: int
     pixpark_endpoint: str
@@ -221,6 +223,12 @@ def load_settings() -> Settings:
             "MAX_CLARIFICATION_ROUNDS", 2, minimum=0, maximum=5
         ),
         repair_attempts=_as_int("REPAIR_ATTEMPTS", 2, minimum=0, maximum=5),
+        semantic_audit_enabled=_as_bool(
+            os.getenv("SEMANTIC_AUDIT_ENABLED"), default=True
+        ),
+        post_image_audit_enabled=_as_bool(
+            os.getenv("POST_IMAGE_AUDIT_ENABLED"), default=True
+        ),
         image_generation_enabled=_as_bool(
             os.getenv("IMAGE_GENERATION_ENABLED"), default=False
         ),
@@ -270,6 +278,8 @@ def public_configuration(settings: Settings) -> dict[str, Any]:
         "model_api_key_configured": bool(settings.model_api_key),
         "pixpark_token_configured": bool(settings.pixpark_token),
         "image_generation_enabled": settings.image_generation_enabled,
+        "semantic_audit_enabled": settings.semantic_audit_enabled,
+        "post_image_audit_enabled": settings.post_image_audit_enabled,
         "style_reference_configured": settings.style_reference_configured,
         "model_configured": settings.model_configured,
         "pixpark_configured": settings.pixpark_configured,
