@@ -1,0 +1,692 @@
+<!--
+THESIS: One image enters one visible production line and exits as an auditable task result; refuse chat UI and dashboard sprawl.
+OWN-WORLD: Cool inspection surfaces, graphite type, exact dividers, sparse Haoyue blue, and registration-mark details.
+STORY: Upload, optionally clarify, start once, watch the fixed stages, then copy or continue to the reserved result image.
+FIRST VIEWPORT: A 16:9 vertical intake station owns the screen; upload dominates, note and primary action follow without detours.
+FORM: Vertical production line, selected as option B by the user; completed outputs switch inside one result station instead of extending the page.
+-->
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="上传一张皓月项目需求图，自动生成并校验 3D 建模参考提示词。"
+    />
+    <title>皓月 3D 需求解析</title>
+    <link rel="stylesheet" href="/static/styles.css?v=20260802-1" />
+    <script src="/static/app.js?v=20260802-1" defer></script>
+  </head>
+  <body data-mode="idle">
+    <div class="app-frame">
+      <header class="topbar">
+      <a class="brand" href="/" aria-label="皓月 3D 需求解析首页">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 32 32" role="img">
+            <rect x="3" y="3" width="26" height="26" rx="8"></rect>
+            <path d="M10 16h12"></path>
+          </svg>
+        </span>
+        <span class="brand-copy">
+          <strong>皓月 3D 需求解析</strong>
+          <small>建模提示词检验台</small>
+        </span>
+      </a>
+      <div class="topbar-tools">
+        <div class="service-state" id="serviceState" aria-live="polite">
+          <span class="state-dot" aria-hidden="true"></span>
+          <span>正在检查服务</span>
+        </div>
+        <button class="config-trigger" id="configTrigger" type="button">
+          服务配置
+        </button>
+      </div>
+      </header>
+
+      <main class="page-shell">
+      <section class="intro" aria-labelledby="pageTitle">
+        <p class="process-kicker">先核对提示词 · 确认后再生图</p>
+        <h1 id="pageTitle">把完整需求图放进来</h1>
+        <p>
+          批注、箭头、文字、布局权限和建模要求由后台自动处理。你只需要上传图片，
+          有额外要求时补充一句。
+        </p>
+      </section>
+
+      <div class="config-notice" id="configNotice" role="alert" hidden>
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M12 8v5m0 3.5v.01M4.9 20h14.2a2 2 0 0 0 1.73-3L13.73 4.5a2 2 0 0 0-3.46 0L3.17 17a2 2 0 0 0 1.73 3Z"></path>
+        </svg>
+        <div>
+          <strong>服务还差一步配置</strong>
+          <p id="configMessage">请联系管理员完成模型 API 和图2参考图配置。</p>
+        </div>
+        <button class="notice-action" id="configNoticeAction" type="button">
+          现在配置
+        </button>
+      </div>
+
+      <section
+        class="config-station"
+        id="configStation"
+        aria-labelledby="configTitle"
+        hidden
+      >
+        <div class="config-station-heading">
+          <div>
+            <p class="process-kicker">服务配置 · 保存后立即生效</p>
+            <h1 id="configTitle">连接解析模型与 PixPark</h1>
+            <p>
+              这里只配置服务连接，不改变 Skill 流程或提示词规则。固定图2仍从服务器目录读取。
+            </p>
+          </div>
+          <button class="text-button" id="configCloseButton" type="button">
+            返回解析
+          </button>
+        </div>
+
+        <div class="config-status-strip" aria-label="当前配置状态">
+          <span class="config-status" id="modelConfigStatus">
+            <i aria-hidden="true"></i>模型接口 · 检查中
+          </span>
+          <span class="config-status" id="styleConfigStatus">
+            <i aria-hidden="true"></i>固定图2 · 检查中
+          </span>
+          <span class="config-status" id="pixparkConfigStatus">
+            <i aria-hidden="true"></i>PixPark · 检查中
+          </span>
+        </div>
+
+        <form class="service-config-form" id="serviceConfigForm" novalidate>
+          <fieldset class="config-group">
+            <legend>
+              <span>01</span>
+              <strong>解析模型</strong>
+              <small>OpenAI 兼容的多模态 Chat Completions 接口</small>
+            </legend>
+
+            <div class="config-fields two-columns">
+              <label class="config-field">
+                <span>模型 API 地址</span>
+                <input
+                  id="modelBaseUrlInput"
+                  type="url"
+                  maxlength="2048"
+                  placeholder="https://api.example.com/v1"
+                  autocomplete="url"
+                  required
+                />
+                <small>可填到 /v1，也可填写完整的 /chat/completions 地址。</small>
+              </label>
+
+              <label class="config-field">
+                <span>模型名称</span>
+                <input
+                  id="modelNameInput"
+                  type="text"
+                  maxlength="200"
+                  placeholder="支持图片输入的模型名称"
+                  spellcheck="false"
+                  required
+                />
+                <small>必须与模型服务实际支持的名称一致。</small>
+              </label>
+            </div>
+
+            <div class="secret-row">
+              <label class="config-field">
+                <span>模型 API Key <em id="modelKeyState">未配置</em></span>
+                <input
+                  id="modelApiKeyInput"
+                  type="password"
+                  maxlength="8192"
+                  placeholder="输入新的 API Key"
+                  autocomplete="new-password"
+                  spellcheck="false"
+                />
+                <small>留空会保留现有值；保存后页面不会回显原文。</small>
+              </label>
+              <label class="clear-secret-option">
+                <input id="clearModelApiKeyInput" type="checkbox" />
+                <span>清除已保存的 API Key</span>
+              </label>
+            </div>
+          </fieldset>
+
+          <fieldset class="config-group">
+            <legend>
+              <span>02</span>
+              <strong>结果图生成</strong>
+              <small>PixPark v3 · Token 仅交给本机后端</small>
+            </legend>
+
+            <div class="pixpark-config-line">
+              <label class="config-field">
+                <span>PixPark Token <em id="pixparkTokenState">未配置</em></span>
+                <input
+                  id="pixparkTokenInput"
+                  type="password"
+                  maxlength="8192"
+                  placeholder="输入新的 PixPark Token"
+                  autocomplete="new-password"
+                  spellcheck="false"
+                />
+                <small>留空会保留现有值；Token 不会出现在状态接口和任务结果里。</small>
+              </label>
+
+              <label class="generation-switch" for="imageGenerationInput">
+                <input id="imageGenerationInput" type="checkbox" />
+                <span class="switch-control" aria-hidden="true"></span>
+                <span>
+                  <strong>允许确认提示词后生成结果图</strong>
+                  <small>不会自动生图；关闭时仍会完整输出提示词和解析详情。</small>
+                </span>
+              </label>
+            </div>
+
+            <label class="clear-secret-option">
+              <input id="clearPixparkTokenInput" type="checkbox" />
+              <span>清除已保存的 PixPark Token</span>
+            </label>
+          </fieldset>
+
+          <div class="config-save-row">
+            <p id="configSaveStatus" role="status">
+              配置保存在项目私有文件 .runtime/runtime-settings.json；页面只显示配置状态。
+            </p>
+            <button class="primary-button config-save-button" id="configSaveButton" type="submit">
+              <span>保存并应用</span>
+            </button>
+          </div>
+          <p class="field-error config-error" id="configError" role="alert" hidden></p>
+        </form>
+
+        <div class="config-footnote">
+          <strong>固定图2</strong>
+          <p>
+            请继续把人工建模风格图放在
+            <code>config/style-reference.png</code>。当前配置页面不会上传或替换它。
+          </p>
+        </div>
+      </section>
+
+      <div class="workspace-layout">
+        <aside
+          class="history-rail"
+          id="historyRail"
+          aria-labelledby="historyTitle"
+        >
+          <div class="history-heading">
+            <div>
+              <h2 id="historyTitle">历史记录</h2>
+              <p>临时保留期内可跨刷新与服务重启恢复</p>
+            </div>
+          </div>
+          <div class="history-empty" id="historyEmpty">
+            <strong>还没有记录</strong>
+            <p>完成第一次提示词解析后，会出现在这里。</p>
+          </div>
+          <div class="history-list" id="historyList" aria-live="polite"></div>
+        </aside>
+
+        <section class="production-line" aria-label="需求解析生产线">
+        <form class="intake-station" id="uploadForm" novalidate>
+          <div class="station-heading">
+            <span class="station-index" aria-hidden="true">输入</span>
+            <div>
+              <h2>需求图</h2>
+              <p>上传包含主画面、批注、箭头和局部参考的完整图片。</p>
+            </div>
+          </div>
+
+          <div class="revision-context" id="revisionContext" hidden>
+            <div>
+              <strong id="revisionTitle">正在修改上一版需求</strong>
+              <span id="revisionHint">可继续编辑补充要求；重新选择图片会替换当前图1。</span>
+            </div>
+            <button class="text-button" id="cancelRevisionButton" type="button">
+              取消修改
+            </button>
+          </div>
+
+          <input
+            type="file"
+            id="imageInput"
+            name="image"
+            accept="image/png,image/jpeg,image/webp"
+            hidden
+          />
+
+          <div class="upload-control">
+            <button
+              class="dropzone"
+              id="dropzone"
+              type="button"
+              aria-describedby="uploadHint uploadError"
+            >
+              <span class="dropzone-empty" id="dropzoneEmpty">
+                <span class="upload-glyph" aria-hidden="true">
+                  <svg viewBox="0 0 32 32">
+                    <path d="M16 21V7m0 0-5 5m5-5 5 5"></path>
+                    <path d="M7 20v4a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-4"></path>
+                  </svg>
+                </span>
+                <strong>点击选择，或把图片拖到这里</strong>
+                <span id="uploadHint">
+                  PNG、JPEG、WebP · 最大 <span id="maxUploadLabel">15 MB</span>
+                </span>
+              </span>
+              <span class="dropzone-preview" id="dropzonePreview" hidden>
+                <span class="preview-media" id="previewMedia"></span>
+                <span class="file-meta">
+                  <strong id="fileName"></strong>
+                  <span id="fileSize"></span>
+                </span>
+                <span class="replace-action">重新选择</span>
+              </span>
+            </button>
+            <p class="field-error" id="uploadError" role="alert" hidden></p>
+          </div>
+
+          <div class="field-group">
+            <div class="field-heading">
+              <label for="noteInput">补充要求 <span>选填</span></label>
+              <output id="noteCount" for="noteInput">0 / 1000</output>
+            </div>
+            <textarea
+              id="noteInput"
+              name="note"
+              maxlength="1000"
+              rows="4"
+              placeholder="例如：整体布局不要动，只把人物换成螺丝小人。"
+            ></textarea>
+          </div>
+
+          <label class="enrichment-option" for="enrichmentInput">
+            <input
+              id="enrichmentInput"
+              name="enrichment_enabled"
+              type="checkbox"
+            />
+            <span class="option-control" aria-hidden="true"></span>
+            <span class="option-copy">
+              <strong>丰富趣味</strong>
+              <small>
+                在需求与布局锁定后，增加一个主创意和关联功能模块；优先复用大体块，
+                不堆零碎道具。
+              </small>
+            </span>
+          </label>
+
+          <div class="submit-row">
+            <button class="primary-button" id="submitButton" type="submit" disabled>
+              <span>开始解析</span>
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M5 12h13m-5-5 5 5-5 5"></path>
+              </svg>
+            </button>
+            <p>
+              图2由服务器自动加入；需求图仅在任务保留期内临时保存。
+            </p>
+          </div>
+        </form>
+
+        <div class="output-column">
+        <section class="process-station" id="processStation" aria-live="polite" hidden>
+          <div class="station-heading compact">
+            <span class="station-index" aria-hidden="true">处理</span>
+            <div>
+              <h2 id="processTitle">读取需求图</h2>
+              <p id="processMessage">正在建立当前任务的内容清单。</p>
+            </div>
+            <span class="working-indicator" id="workingIndicator" aria-hidden="true"></span>
+          </div>
+
+          <ol class="stage-rail" id="stageRail">
+            <li data-stage="analyzing">
+              <span>1</span>
+              <strong>识别需求</strong>
+            </li>
+            <li data-stage="composing">
+              <span>2</span>
+              <strong>组装规则</strong>
+            </li>
+            <li data-stage="validating">
+              <span>3</span>
+              <strong>审查提示词</strong>
+            </li>
+            <li data-stage="review_prompt">
+              <span>4</span>
+              <strong>人工确认</strong>
+            </li>
+            <li data-stage="generating_image">
+              <span>5</span>
+              <strong>生成结果图</strong>
+            </li>
+          </ol>
+
+          <div class="process-controls">
+            <p id="stallNotice" role="status" hidden>
+              处理时间比平时更长。你可以继续等待，也可以取消后检查原图。
+            </p>
+            <div class="process-task-actions">
+              <button
+                class="text-button background-task-button"
+                id="backgroundTaskButton"
+                type="button"
+              >
+                另起一个任务
+              </button>
+              <button class="text-button cancel-button" id="cancelButton" type="button">
+                取消任务
+              </button>
+            </div>
+          </div>
+
+          <form class="clarification" id="clarificationForm" hidden>
+            <label for="clarificationInput" id="clarificationQuestion"></label>
+            <div class="clarification-row">
+              <input
+                id="clarificationInput"
+                type="text"
+                maxlength="1000"
+                placeholder="在这里补充后继续"
+              />
+              <button type="submit">补充并继续</button>
+            </div>
+            <p class="field-error" id="clarificationError" role="alert" hidden></p>
+          </form>
+
+          <div class="error-state" id="errorState" role="alert" tabindex="-1" hidden>
+            <strong>这次没有完成</strong>
+            <p id="errorMessage"></p>
+            <button type="button" id="retryButton">返回检查输入</button>
+          </div>
+        </section>
+
+        <section
+          class="result-station"
+          id="resultStation"
+          aria-labelledby="resultTitle"
+        >
+          <div class="station-heading compact">
+            <span class="station-index" aria-hidden="true">输出</span>
+            <div>
+              <h2 id="resultTitle" tabindex="-1">任务输出</h2>
+              <p id="resultSubtitle">提示词通过审查后，可继续生成关联结果图。</p>
+            </div>
+            <div class="result-actions" id="resultActions" hidden>
+              <button class="text-button" id="reviseTaskButton" type="button">
+                修改需求
+              </button>
+              <button class="text-button" id="downloadButton" type="button">
+                下载 Markdown
+              </button>
+              <button class="text-button" id="newTaskButton" type="button">
+                新建任务
+              </button>
+            </div>
+          </div>
+
+          <div class="review-context" id="reviewContext" hidden>
+            <button class="source-review" id="sourceReviewButton" type="button">
+              <span class="source-thumb-frame" id="sourceThumbFrame" aria-hidden="true"></span>
+              <span>
+                <strong>核对原始需求图</strong>
+                <small id="sourceReviewName"></small>
+              </span>
+            </button>
+            <p>
+              <strong>结构规则已检查</strong>
+              仍需人工核对主体、文字、颜色与布局。
+            </p>
+          </div>
+
+          <div class="result-tabs" role="tablist" aria-label="任务结果类型">
+            <button
+              id="resultTabPositive"
+              type="button"
+              role="tab"
+              aria-selected="true"
+              aria-controls="resultPanelPositive"
+              data-result-tab="positive"
+            >
+              正向提示词
+            </button>
+            <button
+              id="resultTabNegative"
+              type="button"
+              role="tab"
+              aria-selected="false"
+              aria-controls="resultPanelNegative"
+              data-result-tab="negative"
+            >
+              负面提示词
+            </button>
+            <button
+              id="resultTabDetails"
+              type="button"
+              role="tab"
+              aria-selected="false"
+              aria-controls="resultPanelDetails"
+              data-result-tab="details"
+            >
+              解析详情
+            </button>
+            <button
+              id="resultTabImage"
+              type="button"
+              role="tab"
+              aria-selected="false"
+              aria-controls="resultPanelImage"
+              data-result-tab="image"
+            >
+              结果图
+            </button>
+          </div>
+
+          <div class="prompt-results" id="promptResults">
+            <section
+              class="result-panel"
+              id="resultPanelImage"
+              role="tabpanel"
+              aria-labelledby="resultTabImage"
+              data-result-panel="image"
+              hidden
+            >
+              <figure class="image-result" id="imageResult">
+                <div
+                  class="generated-image-grid"
+                  id="generatedImageGrid"
+                  aria-label="本次生成的结果图"
+                  hidden
+                ></div>
+                <div class="image-empty" id="imageEmpty">
+                  <span class="registration-mark" aria-hidden="true"></span>
+                  <strong id="imageEmptyTitle">结果图状态</strong>
+                  <p id="imageEmptyText">
+                    提交后将在这里显示生成进度或最终图片。
+                  </p>
+                  <button
+                    class="secondary-button image-resume-button"
+                    id="imageResumeButton"
+                    type="button"
+                    hidden
+                  >
+                    继续查询原任务
+                  </button>
+                </div>
+                <div class="image-regeneration" id="imageRegeneration" hidden>
+                  <span>保留当前提示词，重新创建一组结果。</span>
+                  <button
+                    class="secondary-button"
+                    id="regenerateImageButton"
+                    type="button"
+                  >
+                    重新生成 4 张结果图
+                  </button>
+                </div>
+                <figcaption id="imageCaption">结果图 · 与本任务提示词保持同一上下文</figcaption>
+              </figure>
+            </section>
+
+            <section
+              class="result-panel"
+              id="resultPanelPositive"
+              role="tabpanel"
+              aria-labelledby="resultTabPositive"
+              data-result-panel="positive"
+            >
+              <article class="prompt-block">
+                <div class="prompt-heading">
+                  <div>
+                    <span>正向</span>
+                    <h3>纯净生图提示词</h3>
+                  </div>
+                  <button
+                    class="copy-button"
+                    type="button"
+                    data-copy-target="positivePrompt"
+                  >
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                      <rect x="8" y="8" width="11" height="11" rx="2"></rect>
+                      <path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"></path>
+                    </svg>
+                    复制
+                  </button>
+                </div>
+                <pre id="positivePrompt">解析完成后，正向提示词会先出现在这里。</pre>
+                <div class="prompt-approval" id="promptApproval" hidden>
+                  <div>
+                    <strong>提示词确认</strong>
+                    <p id="promptApprovalText">
+                      请先对照需求图检查主体、文字、颜色与布局；确认无误后再生图。
+                    </p>
+                  </div>
+                  <div class="prompt-approval-actions">
+                    <button
+                      class="secondary-button regenerate-prompt-button"
+                      id="regeneratePromptButton"
+                      type="button"
+                    >
+                      重新生成创意和提示词
+                    </button>
+                    <button
+                      class="primary-button generate-image-button"
+                      id="generateImageButton"
+                      type="button"
+                    >
+                      确认提示词，一次生成 4 张
+                    </button>
+                  </div>
+                </div>
+              </article>
+            </section>
+
+            <section
+              class="result-panel"
+              id="resultPanelNegative"
+              role="tabpanel"
+              aria-labelledby="resultTabNegative"
+              data-result-panel="negative"
+              hidden
+            >
+              <article class="prompt-block negative">
+                <div class="prompt-heading">
+                  <div>
+                    <span>负向</span>
+                    <h3>纯净负面提示词</h3>
+                  </div>
+                  <button
+                    class="copy-button"
+                    type="button"
+                    data-copy-target="negativePrompt"
+                  >
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                      <rect x="8" y="8" width="11" height="11" rx="2"></rect>
+                      <path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"></path>
+                    </svg>
+                    复制
+                  </button>
+                </div>
+                <pre id="negativePrompt"></pre>
+              </article>
+            </section>
+
+            <section
+              class="result-panel details-panel"
+              id="resultPanelDetails"
+              role="tabpanel"
+              aria-labelledby="resultTabDetails"
+              data-result-panel="details"
+              hidden
+            >
+              <div class="audit-pass" id="auditPass">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="m5 12 4 4L19 6"></path>
+                </svg>
+                <div>
+                  <strong>结构规则检查已通过</strong>
+                  <p id="auditSummary">
+                    已检查图号、复制区、背景硬句和内部字段；内容仍需人工核对。
+                  </p>
+                </div>
+              </div>
+              <div class="detail-list" id="detailList"></div>
+            </section>
+          </div>
+        </section>
+        </div>
+      </section>
+      </div>
+      </main>
+    </div>
+
+    <dialog class="source-dialog" id="sourceDialog" aria-labelledby="sourceDialogTitle">
+      <div class="source-dialog-heading">
+        <div>
+          <strong id="sourceDialogTitle">原始需求图</strong>
+          <p>请对照批注、主体、文字、颜色与布局检查生成结果。</p>
+        </div>
+        <form method="dialog">
+          <button class="text-button" type="submit">关闭</button>
+        </form>
+      </div>
+      <div class="source-dialog-media" id="sourceDialogMedia"></div>
+    </dialog>
+
+    <dialog
+      class="source-dialog result-image-dialog"
+      id="resultImageDialog"
+      aria-labelledby="resultImageDialogTitle"
+    >
+      <div class="source-dialog-heading">
+        <div>
+          <strong id="resultImageDialogTitle">结果图审查</strong>
+          <p id="resultImageDialogCount" aria-live="polite">方案 1 / 4</p>
+        </div>
+        <form method="dialog">
+          <button class="text-button" type="submit">关闭</button>
+        </form>
+      </div>
+      <div
+        class="source-dialog-media result-image-dialog-media"
+        id="resultImageDialogMedia"
+      ></div>
+      <div class="result-image-dialog-actions">
+        <button class="secondary-button" id="resultImagePreviousButton" type="button">
+          上一张
+        </button>
+        <a class="secondary-button" id="resultImageDownload" href="#" download>
+          下载当前图
+        </a>
+        <button class="secondary-button" id="resultImageNextButton" type="button">
+          下一张
+        </button>
+      </div>
+    </dialog>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  </body>
+</html>

@@ -1,0 +1,24 @@
+.DS_Store
+.env
+.env.*
+.pytest_cache/
+.ruff_cache/
+.venv/
+__pycache__/
+*.py[cod]
+dist/
+generated/
+rollback/
+runtime/
+.runtime/
+.lark-cli-tmp/
+.impeccable/
+*.zip
+
+# Local source boards, exports, and delivery archives are not application code.
+人工效果/
+整理/
+需求/
+飞书文档交付包/
+飞书文档交付包 2/
+新的需求.md
