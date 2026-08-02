@@ -11,6 +11,7 @@ from pathlib import Path
 import httpx
 from PIL import Image
 
+from scripts.validate_output import validate_document
 from webapp.config import RuntimeConfigStore, Settings, public_configuration
 from webapp.model_client import ModelAPIError, OpenAICompatibleClient
 from webapp.parsing import (
@@ -18,7 +19,7 @@ from webapp.parsing import (
     parse_markdown_sections,
     strip_single_code_fence,
 )
-from webapp.pipeline import JobManager, QueueCapacityError
+from webapp.pipeline import JobManager, QueueCapacityError, _prepare_audit_image
 from webapp.pixpark_client import (
     FIXED_CONTRACT,
     RESULT_IMAGE_COUNT,
@@ -29,6 +30,8 @@ from webapp.pixpark_client import (
     parse_mcp_response,
 )
 from webapp.skill_loader import build_skill_prompt
+from webapp.semantic_audit import normalize_image_audit, normalize_prompt_audit
+from webapp.semantic_audit import PROMPT_AUDIT_SYSTEM
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 VALID_OUTPUT = (PROJECT_ROOT / "tests" / "fixtures" / "valid-output.md").read_text(
@@ -42,7 +45,8 @@ class FakeModelClient:
 
     async def complete(self, **kwargs) -> str:
         self.calls += 1
-        if self.calls == 1:
+        system_prompt = kwargs.get("system_prompt", "")
+        if "任务路由器" in system_prompt:
             return """
             {
               "task_type": "LOCK_LAYOUT_EDIT",
@@ -63,12 +67,47 @@ class FakeModelClient:
               "routing_summary": "成熟布局局部修改"
             }
             """
+        if "独立语义审查器" in system_prompt:
+            return json.dumps(
+                {
+                    "pass": True,
+                    "errors": [],
+                    "warnings": [],
+                    "summary": "语义门禁通过",
+                    "checks": {
+                        "hard_requirements": "pass",
+                        "reference_scope": "pass",
+                        "layout_permission": "pass",
+                        "enrichment_event": "pass",
+                        "reachability": "pass",
+                        "clustering": "pass",
+                        "positive_prompt_coverage": "pass",
+                    },
+                },
+                ensure_ascii=False,
+            )
+        if "生成结果的独立需求符合度审查器" in system_prompt:
+            count = max(0, len(kwargs.get("images", [])) - 1)
+            return json.dumps(
+                {
+                    "pass": True,
+                    "errors": [],
+                    "warnings": [],
+                    "summary": "至少一张方案符合需求",
+                    "per_image": [
+                        {"index": index, "pass": True, "errors": []}
+                        for index in range(1, count + 1)
+                    ],
+                    "best_indices": list(range(1, count + 1)),
+                },
+                ensure_ascii=False,
+            )
         return VALID_OUTPUT
 
 
 class OtherRatioModelClient(FakeModelClient):
     async def complete(self, **kwargs) -> str:
-        if self.calls == 0:
+        if "任务路由器" in kwargs.get("system_prompt", ""):
             self.calls += 1
             return """
             {
@@ -90,8 +129,7 @@ class OtherRatioModelClient(FakeModelClient):
               "routing_summary": "用户要求非方形画幅"
             }
             """
-        self.calls += 1
-        return VALID_OUTPUT
+        return await super().complete(**kwargs)
 
 
 class FakePixPark:
@@ -124,6 +162,8 @@ def make_settings(
     *,
     generated_dir: Path | None = None,
     image_generation_enabled: bool = False,
+    semantic_audit_enabled: bool = True,
+    post_image_audit_enabled: bool = True,
 ) -> Settings:
     return Settings(
         project_root=PROJECT_ROOT,
@@ -145,6 +185,8 @@ def make_settings(
         job_ttl_seconds=3600,
         max_clarification_rounds=2,
         repair_attempts=1,
+        semantic_audit_enabled=semantic_audit_enabled,
+        post_image_audit_enabled=post_image_audit_enabled,
         image_generation_enabled=image_generation_enabled,
         max_concurrent_image_jobs=1,
         pixpark_endpoint="https://mcp.example.test/http",
@@ -500,6 +542,7 @@ class FrontendWorkflowTests(unittest.TestCase):
         self.assertIn("确认提示词，一次生成 4 张", html)
         self.assertIn('id="regeneratePromptButton"', html)
         self.assertIn('id="regenerateImageButton"', html)
+        self.assertIn('id="reviewImageButton"', html)
         self.assertIn('id="resultImageDialog"', html)
         self.assertIn("getSafeGeneratedImageUrls", script)
         self.assertIn("renderGeneratedImages", script)
@@ -507,6 +550,7 @@ class FrontendWorkflowTests(unittest.TestCase):
         self.assertNotIn('link.target = "_blank"', script)
         self.assertIn("/prompt/regenerate", script)
         self.assertIn("/image/regenerate", script)
+        self.assertIn("/image/audit", script)
         self.assertIn(".generated-image-grid", styles)
         self.assertIn(
             "grid-template-columns: repeat(2, minmax(0, 1fr));",
@@ -611,6 +655,89 @@ class ParsingTests(unittest.TestCase):
         self.assertNotIn("```", prompt)
 
 
+class SemanticAuditTests(unittest.TestCase):
+    def test_prompt_auditor_knows_project_background_is_not_scope_spread(self) -> None:
+        self.assertIn("PROJECT-BG 是全任务 L0 强制规则", PROMPT_AUDIT_SYSTEM)
+        self.assertIn("永远不属于 TARGET_SCOPE_SPREAD", PROMPT_AUDIT_SYSTEM)
+
+    def test_large_audit_image_is_downscaled_without_changing_source(self) -> None:
+        source = io.BytesIO()
+        Image.new("RGB", (3200, 2400), "navy").save(source, format="PNG")
+        original = source.getvalue()
+        prepared = _prepare_audit_image(
+            original,
+            "image/png",
+            max_dimension=1200,
+        )
+        self.assertEqual(prepared.media_type, "image/jpeg")
+        with Image.open(io.BytesIO(prepared.data)) as image:
+            self.assertLessEqual(max(image.size), 1200)
+        self.assertTrue(original.startswith(b"\x89PNG"))
+
+    def test_prompt_audit_cannot_claim_pass_with_failed_check(self) -> None:
+        result = normalize_prompt_audit(
+            {
+                "pass": True,
+                "errors": [],
+                "warnings": [],
+                "summary": "错误地声称通过",
+                "checks": {"enrichment_event": "fail"},
+            }
+        )
+        self.assertFalse(result["pass"])
+        self.assertEqual(result["errors"][0]["code"], "SEMANTIC_CHECK_CONFLICT")
+
+    def test_prompt_audit_rejection_must_include_repairable_error(self) -> None:
+        result = normalize_prompt_audit(
+            {
+                "pass": False,
+                "errors": [],
+                "warnings": [],
+                "summary": "不通过但没有说明",
+                "checks": {},
+            }
+        )
+        self.assertFalse(result["pass"])
+        self.assertEqual(
+            result["errors"][0]["code"],
+            "SEMANTIC_REVIEW_INCOMPLETE",
+        )
+
+    def test_image_audit_requires_every_image_row(self) -> None:
+        result = normalize_image_audit(
+            {
+                "pass": True,
+                "errors": [],
+                "per_image": [{"index": 1, "pass": True, "errors": []}],
+                "best_indices": [1],
+            },
+            expected_count=2,
+        )
+        self.assertTrue(result["pass"])
+        self.assertFalse(result["per_image"][1]["pass"])
+        self.assertEqual(
+            result["per_image"][1]["errors"][0]["code"],
+            "IMAGE_AUDIT_MISSING",
+        )
+
+    def test_enriched_non_replica_rejects_na_creative_direction(self) -> None:
+        invalid = VALID_OUTPUT.replace(
+            "利用图1既有角色与既有操作台形成一条原位互动：角色位置中心、比例和占位不变，只在原占位内转动头部并把手伸向相邻操作件，手部与操作件形成接触，操作件上的既有指示面产生可见反馈；不新增角色、道具或占位，不改变原布局和遮挡。",
+            "N/A",
+            1,
+        )
+        result = validate_document(
+            invalid,
+            require_negative=True,
+            allow_aspect_ratio=False,
+            anniversary_source="unknown",
+            task_type="LOCK_LAYOUT_EDIT",
+            enrichment_enabled=True,
+        )
+        self.assertFalse(result["pass"])
+        self.assertIn("ENRICHMENT_NA_FORBIDDEN", " ".join(result["errors"]))
+
+
 class SkillLoaderTests(unittest.TestCase):
     def test_always_attaches_internal_index_and_semantic_audit_rules(self) -> None:
         prompt = build_skill_prompt(
@@ -665,6 +792,104 @@ class SkillLoaderTests(unittest.TestCase):
 
 
 class PipelineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_exhausted_semantic_repairs_preserve_audit_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            style_path = Path(directory) / "style-reference.png"
+            Image.new("RGB", (400, 400), "gray").save(style_path)
+
+            class AlwaysFailAuditClient(FakeModelClient):
+                async def complete(self, **kwargs) -> str:
+                    if "独立语义审查器" in kwargs.get("system_prompt", ""):
+                        self.calls += 1
+                        return json.dumps(
+                            {
+                                "pass": False,
+                                "errors": [
+                                    {
+                                        "code": "CREATIVE_UNREACHABLE",
+                                        "message": "动作跨越冻结间距。",
+                                        "evidence": "手部无法到达目标",
+                                    }
+                                ],
+                                "warnings": [],
+                                "summary": "动作不可达",
+                                "checks": {"reachability": "fail"},
+                            },
+                            ensure_ascii=False,
+                        )
+                    return await super().complete(**kwargs)
+
+            settings = make_settings(style_path)
+            object.__setattr__(settings, "repair_attempts", 1)
+            manager = JobManager(settings, client=AlwaysFailAuditClient())
+            record = manager.create(
+                filename="需求图.png",
+                media_type="image/png",
+                image_bytes=_make_image_bytes(),
+                note="",
+                enrichment_enabled=True,
+            )
+            assert record.task is not None
+            await record.task
+
+            self.assertEqual(record.status, "failed")
+            self.assertEqual(record.result["delivery_status"], "blocked")
+            self.assertEqual(
+                record.result["semantic_audit"]["errors"][0]["code"],
+                "CREATIVE_UNREACHABLE",
+            )
+            self.assertEqual(record.result["image"]["status"], "blocked")
+
+    async def test_semantic_failure_is_repaired_and_reaudited(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            style_path = Path(directory) / "style-reference.png"
+            Image.new("RGB", (400, 400), "gray").save(style_path)
+
+            class RepairingClient(FakeModelClient):
+                def __init__(self) -> None:
+                    super().__init__()
+                    self.audit_calls = 0
+
+                async def complete(self, **kwargs) -> str:
+                    if "独立语义审查器" in kwargs.get("system_prompt", ""):
+                        self.calls += 1
+                        self.audit_calls += 1
+                        if self.audit_calls == 1:
+                            return json.dumps(
+                                {
+                                    "pass": False,
+                                    "errors": [
+                                        {
+                                            "code": "CREATIVE_ONLY_MATERIAL",
+                                            "message": "材质细化不能充当创意事件。",
+                                            "evidence": "创意方向仅描述材质",
+                                        }
+                                    ],
+                                    "warnings": [],
+                                    "summary": "需要补充原位因果事件",
+                                    "checks": {"enrichment_event": "fail"},
+                                },
+                                ensure_ascii=False,
+                            )
+                    return await super().complete(**kwargs)
+
+            client = RepairingClient()
+            manager = JobManager(make_settings(style_path), client=client)
+            record = manager.create(
+                filename="需求图.png",
+                media_type="image/png",
+                image_bytes=_make_image_bytes(),
+                note="",
+                enrichment_enabled=True,
+            )
+            assert record.task is not None
+            await record.task
+
+            self.assertEqual(record.status, "prompt_ready", record.error)
+            self.assertEqual(record.result["repair_attempts"], 1)
+            self.assertEqual(client.audit_calls, 2)
+            self.assertTrue(record.result["semantic_audit"]["pass"])
+
     async def test_complete_job_returns_prompt_review_contract(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             style_path = Path(directory) / "style-reference.png"
@@ -690,8 +915,10 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0.01)
 
             self.assertEqual(record.status, "prompt_ready", record.error)
-            self.assertEqual(client.calls, 2)
+            self.assertEqual(client.calls, 3)
             self.assertTrue(record.result["validation"]["pass"])
+            self.assertTrue(record.result["mechanical_validation"]["pass"])
+            self.assertTrue(record.result["semantic_audit"]["pass"])
             self.assertEqual(record.result["image"]["status"], "disabled")
             self.assertIsNone(record.result["image"]["url"])
 
@@ -742,6 +969,8 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(record.status, "complete", record.error)
             self.assertEqual(record.result["image"]["status"], "completed")
+            self.assertTrue(record.result["image"]["platform_audit"]["pass"])
+            self.assertTrue(record.result["image"]["requirement_audit"]["pass"])
             self.assertTrue(record.result["image"]["url"].startswith("/generated/"))
             self.assertEqual(
                 len(record.result["image"]["urls"]),
@@ -771,7 +1000,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0.01)
 
             self.assertEqual(record.status, "prompt_ready", record.error)
-            self.assertEqual(fake_model.calls, 2)
+            self.assertEqual(fake_model.calls, 3)
             self.assertTrue(record.result["validation"]["pass"])
             self.assertEqual(record.result["image"]["status"], "ready")
             self.assertTrue(record.image_bytes)
@@ -848,6 +1077,125 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(record.result["image"]["expected_count"], 4)
             self.assertEqual(len(record.result["image"]["urls"]), 2)
             self.assertIn("2/4", record.result["image"]["message"])
+
+    async def test_requirement_audit_failure_keeps_images_for_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            style_path = root / "style-reference.png"
+            generated_dir = root / "generated"
+            generated_dir.mkdir()
+            Image.new("RGB", (400, 400), "gray").save(style_path)
+            settings = make_settings(
+                style_path,
+                generated_dir=generated_dir,
+                image_generation_enabled=True,
+            )
+            fake_pixpark = FakePixPark(settings)
+
+            class FailingImageAuditClient(FakeModelClient):
+                async def complete(self, **kwargs) -> str:
+                    if "生成结果的独立需求符合度审查器" in kwargs.get(
+                        "system_prompt", ""
+                    ):
+                        self.calls += 1
+                        return json.dumps(
+                            {
+                                "pass": False,
+                                "errors": [
+                                    {
+                                        "code": "REDLINE_DELETE_MISSING",
+                                        "message": "红线删除目标仍然可见。",
+                                        "evidence": "四张方案均保留目标",
+                                    }
+                                ],
+                                "warnings": [],
+                                "summary": "删除目标仍然存在",
+                                "per_image": [
+                                    {
+                                        "index": index,
+                                        "pass": False,
+                                        "errors": [
+                                            {
+                                                "code": "REDLINE_DELETE_MISSING",
+                                                "message": "删除目标仍然可见。",
+                                                "evidence": "目标可见",
+                                            }
+                                        ],
+                                    }
+                                    for index in range(1, 5)
+                                ],
+                                "best_indices": [],
+                            },
+                            ensure_ascii=False,
+                        )
+                    return await super().complete(**kwargs)
+
+            manager = JobManager(
+                settings,
+                client=FailingImageAuditClient(),
+                pixpark_factory=lambda _: fake_pixpark,
+            )
+            record = manager.create(
+                filename="需求图.png",
+                media_type="image/png",
+                image_bytes=_make_image_bytes(),
+                note="",
+            )
+            assert record.task is not None
+            await record.task
+            manager.generate_image(record.id)
+            assert record.task is not None
+            await record.task
+
+            self.assertEqual(record.status, "complete", record.error)
+            self.assertEqual(record.result["image"]["status"], "needs_revision")
+            self.assertTrue(record.result["image"]["platform_audit"]["pass"])
+            self.assertFalse(record.result["image"]["requirement_audit"]["pass"])
+            self.assertEqual(len(record.result["image"]["urls"]), 4)
+            self.assertIn("需求符合度", record.result["image"]["message"])
+
+    async def test_requirement_audit_can_retry_without_new_pix_task(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            style_path = root / "style-reference.png"
+            generated_dir = root / "generated"
+            generated_dir.mkdir()
+            Image.new("RGB", (400, 400), "gray").save(style_path)
+            settings = make_settings(
+                style_path,
+                generated_dir=generated_dir,
+                image_generation_enabled=True,
+            )
+            fake_pixpark = FakePixPark(settings)
+            manager = JobManager(
+                settings,
+                client=FakeModelClient(),
+                pixpark_factory=lambda _: fake_pixpark,
+            )
+            record = manager.create(
+                filename="需求图.png",
+                media_type="image/png",
+                image_bytes=_make_image_bytes(),
+                note="",
+            )
+            assert record.task is not None
+            await record.task
+            manager.generate_image(record.id)
+            assert record.task is not None
+            await record.task
+            self.assertEqual(len(fake_pixpark.prompts), 1)
+
+            record.result["image"]["requirement_audit"] = {
+                "status": "unavailable",
+                "pass": None,
+            }
+            manager.review_image(record.id)
+            assert record.task is not None
+            await record.task
+
+            self.assertEqual(record.status, "complete")
+            self.assertTrue(record.result["image"]["requirement_audit"]["pass"])
+            self.assertEqual(len(fake_pixpark.prompts), 1)
 
     async def test_non_square_request_skips_fixed_square_generator(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

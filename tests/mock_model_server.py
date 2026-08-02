@@ -35,6 +35,40 @@ CLASSIFICATION = json.dumps(
     ensure_ascii=False,
 )
 
+PROMPT_AUDIT = json.dumps(
+    {
+        "pass": True,
+        "errors": [],
+        "warnings": [],
+        "summary": "浏览器验收语义审查通过",
+        "checks": {
+            "hard_requirements": "pass",
+            "reference_scope": "pass",
+            "layout_permission": "pass",
+            "enrichment_event": "pass",
+            "reachability": "pass",
+            "clustering": "pass",
+            "positive_prompt_coverage": "pass",
+        },
+    },
+    ensure_ascii=False,
+)
+
+IMAGE_AUDIT = json.dumps(
+    {
+        "pass": True,
+        "errors": [],
+        "warnings": [],
+        "summary": "浏览器验收结果图复查通过",
+        "per_image": [
+            {"index": index, "pass": True, "errors": []}
+            for index in range(1, 5)
+        ],
+        "best_indices": [1, 2, 3, 4],
+    },
+    ensure_ascii=False,
+)
+
 
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
@@ -44,11 +78,14 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         body = json.loads(self.rfile.read(length))
         system_text = body["messages"][0]["content"]
-        content = (
-            CLASSIFICATION
-            if "任务路由器" in system_text
-            else VALID_OUTPUT
-        )
+        if "任务路由器" in system_text:
+            content = CLASSIFICATION
+        elif "独立语义审查器" in system_text:
+            content = PROMPT_AUDIT
+        elif "生成结果的独立需求符合度审查器" in system_text:
+            content = IMAGE_AUDIT
+        else:
+            content = VALID_OUTPUT
         payload = json.dumps(
             {
                 "choices": [
