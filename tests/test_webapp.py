@@ -1528,6 +1528,8 @@ class PixParkContractTests(unittest.IsolatedAsyncioTestCase):
             for _, gpt_arguments in client.tool_calls[1:]:
                 for key, value in GPT_CONTRACT.items():
                     self.assertEqual(gpt_arguments[key], value)
+                self.assertEqual(gpt_arguments["imageScale"], "1536x2048")
+                self.assertEqual(gpt_arguments["quality"], 2)
             self.assertEqual(
                 sorted(client.persisted_before_poll),
                 ["gpt_1", "gpt_2", "nano"],
@@ -1879,7 +1881,7 @@ class PixParkContractTests(unittest.IsolatedAsyncioTestCase):
                 (
                     "Nano Banana · 4K",
                     "Nano Banana · 4K",
-                    "GPT · 2K档",
+                    "GPT · 2K",
                 ),
             )
 
@@ -1895,8 +1897,8 @@ class PixParkContractTests(unittest.IsolatedAsyncioTestCase):
                 (
                     "Nano Banana · 4K",
                     "Nano Banana · 4K",
-                    "GPT · 2K档",
-                    "GPT · 2K档",
+                    "GPT · 2K",
+                    "GPT · 2K",
                 ),
             )
 

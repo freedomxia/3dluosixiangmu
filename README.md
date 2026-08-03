@@ -10,7 +10,7 @@
 - 纯净负面提示词
 - 需求解析、任务类型、审查和建模要点
 - 可下载的完整 Markdown 结果
-- 可选的 PixPark Nano 4K + GPT `quality=2`（2K档）双模型结果图
+- 可选的 PixPark Nano 4K + GPT 2K 双模型结果图
 
 ## Docker 启动
 
@@ -101,7 +101,7 @@ PIX_PARK_TOKEN=replace-with-your-token
 
 返工分为三种明确动作：“修改需求”会把当前补充要求重新开放编辑，并允许沿用原图或上传新版图1，提交为新的历史任务而不覆盖旧版；“重新生成创意和提示词”会在当前任务内保留原始图1、补充要求和“丰富趣味”选项，重新执行需求识别、提示词生成与审查；“双模型重新生成 4 张”会保留已经确认的提示词，重新创建一组 Nano 与 GPT 任务。重新生成动作会先确认，并在任务处理中禁用重复提交。
 
-当前一次确认固定并发创建并轮询三个远端任务：Nano Banana 使用 `imageGenerationUsingPOST`，参数为 version 3、3:4、4K、单任务2张、关闭 Google Search；GPT 使用 `drawImageUsingPOST` 创建两个独立任务，每个任务参数均为 version 2、`quality=2`（2K 档）、`768x1024`（3:4）、1张、自动背景。GPT 下游会把单任务 `imageNum=2` 静默改成1，因此必须拆成两个任务才能稳定得到2张。前两张固定来自 Nano，后两张固定来自 GPT，页面会显示模型与分辨率标签。接口比例不会被写成提示词里的画幅标志；若用户明确要求非 3:4 画幅，网站保留提示词结果并禁用生图确认，避免静默改画幅。
+当前一次确认固定并发创建并轮询三个远端任务：Nano Banana 使用 `imageGenerationUsingPOST`，参数为 version 3、3:4、4K、单任务2张、关闭 Google Search；GPT 使用 `drawImageUsingPOST` 创建两个独立任务，每个任务参数均为 version 2、`quality=2`、`1536x2048`（真实2K、3:4）、1张、自动背景。该 GPT 规格已经过真实任务验证，下载文件实际为 `1536x2048` PNG。GPT 下游会把单任务 `imageNum=2` 静默改成1，因此必须拆成两个任务才能稳定得到2张。前两张固定来自 Nano，后两张固定来自 GPT，页面会显示模型与分辨率标签。接口比例不会被写成提示词里的画幅标志；若用户明确要求非 3:4 画幅，网站保留提示词结果并禁用生图确认，避免静默改画幅。
 
 三个 PixPark `taskCode` 都会在第一次查询前按通道原子写入 `generated/pixpark-state/`。任一任务先完成、其他任务超时时，已完成图片立即保留，结果区可以只续查未完成任务，不会重复提交已完成任务。浏览器只记住非敏感的本地任务编号；即使网站进程重启，也能从状态文件恢复三任务进度。恢复模式不持久化用户原图、提示词或预签名地址。只有 `imageAuditStatus === true` 且结果地址非空时才会保存并展示图片；若服务只返回部分审核通过的结果，会保留可用图片并明确显示实际数量。
 
@@ -154,8 +154,8 @@ uvicorn webapp.app:app --reload
   "items": [
     {"url": "/generated/<任务编号>-1.png", "model": "Nano Banana · 4K"},
     {"url": "/generated/<任务编号>-2.png", "model": "Nano Banana · 4K"},
-    {"url": "/generated/<任务编号>-3.png", "model": "GPT · 2K档"},
-    {"url": "/generated/<任务编号>-4.png", "model": "GPT · 2K档"}
+    {"url": "/generated/<任务编号>-3.png", "model": "GPT · 2K"},
+    {"url": "/generated/<任务编号>-4.png", "model": "GPT · 2K"}
   ],
   "count": 4,
   "expected_count": 4,
