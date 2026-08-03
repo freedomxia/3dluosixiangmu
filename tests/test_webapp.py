@@ -579,6 +579,19 @@ class FrontendWorkflowTests(unittest.TestCase):
         self.assertIn('@app.post("/api/jobs/{job_id}/revise"', backend)
         self.assertIn("image: UploadFile | None", backend)
 
+    def test_completed_result_can_upload_a_new_image_as_independent_task(self) -> None:
+        script = (PROJECT_ROOT / "webapp" / "static" / "app.js").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("function beginIndependentTaskFromUpload()", script)
+        self.assertIn('!["prompt_ready", "complete"].includes(task?.status)', script)
+        self.assertIn("resetTask({ preserveBackground: true })", script)
+        self.assertIn('allowNewTaskUpload: true', script)
+        self.assertIn('"上传新图，新建任务"', script)
+        self.assertIn('const endpoint = isRevision', script)
+        self.assertIn(': "/api/jobs";', script)
+
     def test_running_job_can_move_to_background_while_starting_another(self) -> None:
         html = (PROJECT_ROOT / "webapp" / "static" / "index.html").read_text(
             encoding="utf-8"

@@ -39,6 +39,7 @@ const elements = {
   uploadError: document.querySelector("#uploadError"),
   fileName: document.querySelector("#fileName"),
   fileSize: document.querySelector("#fileSize"),
+  replaceAction: document.querySelector(".replace-action"),
   noteInput: document.querySelector("#noteInput"),
   noteCount: document.querySelector("#noteCount"),
   enrichmentInput: document.querySelector("#enrichmentInput"),
@@ -814,6 +815,7 @@ async function selectFile(file) {
     return;
   }
 
+  const previousTaskName = beginIndependentTaskFromUpload();
   if (state.previewUrl && !isRetainedTaskPreview(state.previewUrl)) {
     URL.revokeObjectURL(state.previewUrl);
   }
@@ -826,12 +828,42 @@ async function selectFile(file) {
   elements.dropzonePreview.hidden = false;
   elements.dropzone.classList.add("has-file");
   updateSubmitState();
+  if (previousTaskName) {
+    showToast(`${previousTaskName} 已保留；新图片将创建独立任务。`);
+  }
 }
 
 function setUploadError(message) {
   elements.uploadError.textContent = message;
   elements.uploadError.hidden = !message;
   elements.dropzone.setAttribute("aria-invalid", String(Boolean(message)));
+}
+
+function beginIndependentTaskFromUpload() {
+  const jobId = state.selectedJobId;
+  const task = selectedTask();
+  if (
+    !jobId ||
+    state.revisionSourceJobId ||
+    state.runningJobIds.has(jobId) ||
+    !["prompt_ready", "complete"].includes(task?.status)
+  ) {
+    return "";
+  }
+
+  const pendingPreview = state.pendingDraft?.previewUrl;
+  if (
+    pendingPreview &&
+    pendingPreview !== state.previewUrl &&
+    String(pendingPreview).startsWith("blob:")
+  ) {
+    URL.revokeObjectURL(pendingPreview);
+  }
+  state.pendingDraft = null;
+  const previousTaskName = task.filename || `任务 #${jobId.slice(0, 8).toUpperCase()}`;
+  resetTask({ preserveBackground: true });
+  renderHistory(state.historyItems);
+  return previousTaskName;
 }
 
 function rememberTaskContext(jobId, job = {}) {
@@ -1214,7 +1246,7 @@ function applyJob(job) {
       promptReady: true,
       preferredTab: "positive",
     });
-    setInputLocked(true);
+    setInputLocked(true, { allowNewTaskUpload: true });
     updateSubmitState();
     schedulePoll();
     void loadHistory();
@@ -1228,7 +1260,7 @@ function applyJob(job) {
     clearStallTimer();
     elements.workingIndicator.hidden = true;
     renderResult(job.result, { final: true });
-    setInputLocked(true);
+    setInputLocked(true, { allowNewTaskUpload: true });
     updateSubmitState();
     schedulePoll();
     void loadHistory();
@@ -2004,11 +2036,26 @@ function resetTask(options = {}) {
   }
 }
 
-function setInputLocked(locked) {
-  elements.imageInput.disabled = locked;
-  elements.dropzone.disabled = locked;
+function setInputLocked(locked, options = {}) {
+  const allowNewTaskUpload = Boolean(options.allowNewTaskUpload);
+  elements.imageInput.disabled = locked && !allowNewTaskUpload;
+  elements.dropzone.disabled = locked && !allowNewTaskUpload;
   elements.noteInput.disabled = locked;
   elements.enrichmentInput.disabled = locked;
+  if (allowNewTaskUpload) {
+    elements.replaceAction.textContent = "上传新图，新建任务";
+    elements.dropzone.dataset.uploadIntent = "new-task";
+    elements.dropzone.setAttribute(
+      "aria-label",
+      "上传新的需求图并创建独立任务；当前任务与结果会继续保留",
+    );
+  } else {
+    elements.replaceAction.textContent = state.revisionSourceJobId
+      ? "重新选择图1"
+      : "重新选择";
+    delete elements.dropzone.dataset.uploadIntent;
+    elements.dropzone.removeAttribute("aria-label");
+  }
   elements.configTrigger.disabled = state.submitting || state.runningJobIds.size > 0;
 }
 
