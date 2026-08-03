@@ -10,9 +10,8 @@ services:
     volumes:
       - ./config:/app/config:ro
       - generated-data:/app/generated
-      - runtime-data:/app/runtime
+      - ./.runtime:/app/.runtime
     restart: unless-stopped
 
 volumes:
   generated-data:
-  runtime-data:

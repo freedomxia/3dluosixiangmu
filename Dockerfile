@@ -3,7 +3,7 @@ FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    RUNTIME_DIR=/app/runtime
+    RUNTIME_DIR=/app/.runtime
 
 WORKDIR /app
 
@@ -15,9 +15,9 @@ COPY references ./references
 COPY scripts ./scripts
 COPY webapp ./webapp
 
-RUN mkdir -p /app/config /app/generated /app/runtime \
+RUN mkdir -p /app/config /app/generated /app/.runtime \
     && useradd --create-home --uid 10001 appuser \
-    && chown -R appuser:appuser /app/generated /app/runtime
+    && chown -R appuser:appuser /app/generated /app/.runtime
 
 USER appuser
 

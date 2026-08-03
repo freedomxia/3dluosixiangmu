@@ -109,13 +109,13 @@ PixPark `taskCode` 会在第一次查询前原子写入 `generated/pixpark-state
 
 ## 数据与进程约束
 
-- 页面保存的模型连接和 PixPark 配置写入私有运行目录 `.runtime/runtime-settings.json`，文件权限为 `0600`；Docker 使用不对外提供静态访问的独立 `runtime-data` 命名卷。
+- 页面保存的模型连接和 PixPark 配置直接写入项目目录 `.runtime/runtime-settings.json`，文件权限为 `0600`；Docker 通过绑定挂载读取该项目文件，不再把密钥保存在 Docker 命名卷中。`.runtime/` 已被 Git 忽略，不会提交到 GitHub。
 - 页面读取配置时只返回非敏感字段和布尔状态；已有 API Key 与 Token 不会被回显到输入框、状态接口或任务结果。
 - 修改服务配置时若仍有排队、处理、待补充或生图任务，后台会拒绝切换，避免任务绑定到不同配置。
 - 上传图片和任务元数据按任务原子写入私有运行目录的 `jobs/<任务编号>/`；浏览器刷新或服务重启后可在 TTL 内恢复。
 - 模型阶段在服务重启后使用相同任务编号重新进入解析队列；PixPark 阶段只在远端任务编号已经落盘时继续查询，绝不因重启自动重复提交。
 - 完整提示词、需求图与同页历史记录默认保留 30 天，取消或到期时一并清理；这不是永久项目档案。
-- 后续生成图片写入 Docker 命名卷 `generated-data`，避免 Linux 宿主目录权限覆盖容器内的 UID 10001。
+- 后续生成图片仍写入 Docker 命名卷 `generated-data`，避免 Linux 宿主目录权限覆盖容器内的 UID 10001；只有密钥配置和任务记录保存在项目 `.runtime/` 中。
 - 因为首版使用内存任务队列，Docker 固定运行一个 Uvicorn worker。
 - `MAX_CONCURRENT_JOBS` 控制同时调用模型的任务数，默认值为 2；前端允许继续提交，超过并发数的任务留在队列中。
 - `MAX_CONCURRENT_IMAGE_JOBS` 独立控制 PixPark 图片任务数；图片轮询不会占用模型解析并发。
