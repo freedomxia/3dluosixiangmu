@@ -705,7 +705,7 @@ class JobManager:
             record,
             status="generating_image",
             step="生成结果图",
-            message="已确认提示词，正在生成 Nano 4K 两张与 GPT 2K 两张。",
+            message="已确认提示词，正在生成 Nano 4K 两张与 GPT 2K档两张。",
             error=None,
         )
         self._update_image(
@@ -767,7 +767,7 @@ class JobManager:
             record,
             status="generating_image",
             step="重新生成结果图",
-            message="保留已确认提示词，正在创建新的 Nano 4K 与 GPT 2K 双通道任务。",
+            message="保留已确认提示词，正在创建新的 Nano 4K 与 GPT 2K档双通道任务。",
             error=None,
         )
         self._update_image(
@@ -1201,7 +1201,7 @@ class JobManager:
             ),
             "ready": (
                 "提示词已通过审查；请先人工核对，"
-                "确认后生成 Nano 4K 两张与 GPT 2K 两张。"
+                "确认后生成 Nano 4K 两张与 GPT 2K档两张。"
             ),
         }
         return messages[status]
@@ -1218,7 +1218,7 @@ class JobManager:
             record,
             status="generating_image",
             step="生成结果图",
-            message="提示词已通过审查，正在生成 Nano 4K 两张与 GPT 2K 两张。",
+            message="提示词已通过审查，正在生成 Nano 4K 两张与 GPT 2K档两张。",
         )
         self._update_image(
             record,

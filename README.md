@@ -10,7 +10,7 @@
 - 纯净负面提示词
 - 需求解析、任务类型、审查和建模要点
 - 可下载的完整 Markdown 结果
-- 可选的 PixPark Nano 4K + GPT 2K 双模型结果图
+- 可选的 PixPark Nano 4K + GPT `quality=2`（2K档）双模型结果图
 
 ## Docker 启动
 
@@ -154,8 +154,8 @@ uvicorn webapp.app:app --reload
   "items": [
     {"url": "/generated/<任务编号>-1.png", "model": "Nano Banana · 4K"},
     {"url": "/generated/<任务编号>-2.png", "model": "Nano Banana · 4K"},
-    {"url": "/generated/<任务编号>-3.png", "model": "GPT · 2K"},
-    {"url": "/generated/<任务编号>-4.png", "model": "GPT · 2K"}
+    {"url": "/generated/<任务编号>-3.png", "model": "GPT · 2K档"},
+    {"url": "/generated/<任务编号>-4.png", "model": "GPT · 2K档"}
   ],
   "count": 4,
   "expected_count": 4,

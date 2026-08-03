@@ -1879,7 +1879,7 @@ class PixParkContractTests(unittest.IsolatedAsyncioTestCase):
                 (
                     "Nano Banana · 4K",
                     "Nano Banana · 4K",
-                    "GPT · 2K",
+                    "GPT · 2K档",
                 ),
             )
 
@@ -1895,8 +1895,8 @@ class PixParkContractTests(unittest.IsolatedAsyncioTestCase):
                 (
                     "Nano Banana · 4K",
                     "Nano Banana · 4K",
-                    "GPT · 2K",
-                    "GPT · 2K",
+                    "GPT · 2K档",
+                    "GPT · 2K档",
                 ),
             )
 

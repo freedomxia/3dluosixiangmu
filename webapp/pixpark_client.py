@@ -48,9 +48,9 @@ CHANNEL_EXPECTED_COUNTS = {
 }
 CHANNEL_LABELS = {
     "nano": "Nano Banana · 4K",
-    "gpt_1": "GPT · 2K",
-    "gpt_2": "GPT · 2K",
-    "gpt": "GPT · 2K",
+    "gpt_1": "GPT · 2K档",
+    "gpt_2": "GPT · 2K档",
+    "gpt": "GPT · 2K档",
     "legacy": "PixPark 旧任务",
 }
 CHANNEL_OFFSETS = {"nano": 0, "gpt_1": 2, "gpt_2": 3, "gpt": 2, "legacy": 0}

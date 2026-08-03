@@ -1477,7 +1477,7 @@ async function regenerateImage() {
   if (!jobId || state.runningJobIds.has(jobId)) return;
   if (
     !window.confirm(
-      "将保留当前提示词，重新创建 Nano 4K 与 GPT 2K 两路任务并替换当前结果图。继续吗？",
+      "将保留当前提示词，重新创建 Nano 4K 与 GPT 2K档两路任务并替换当前结果图。继续吗？",
     )
   ) {
     return;
@@ -1618,7 +1618,7 @@ function renderResult(result, options = {}) {
   if (promptReady && image.status === "ready") {
     elements.generateImageButton.hidden = false;
     elements.promptApprovalText.textContent =
-      "不满意可重新走完整解析；确认无误后生成 Nano 4K 两张与 GPT 2K 两张。";
+      "不满意可重新走完整解析；确认无误后生成 Nano 4K 两张与 GPT 2K档两张。";
   } else if (promptReady) {
     elements.generateImageButton.hidden = true;
     elements.promptApprovalText.textContent =
@@ -1706,7 +1706,7 @@ function renderImageStatus(image) {
     ],
     queued: ["等待双模型生成 4 张", "提示词已通过审查，正在等待 Nano 与 GPT 两路队列。"],
     uploading: ["正在上传参考图", image.message || "正在分别上传图1和固定图2。"],
-    creating: ["正在创建双模型任务", image.message || "正在创建 Nano 4K 与 GPT 2K 两路任务。"],
+    creating: ["正在创建双模型任务", image.message || "正在创建 Nano 4K 与 GPT 2K档两路任务。"],
     polling: ["双模型正在生成 4 张", image.message || "正在查询两个远端通道任务。"],
     downloading: ["结果已通过审核", image.message || "正在安全下载审核通过的结果图。"],
     partial: ["已返回部分结果", image.message || "已保留审核通过的结果图。"],
