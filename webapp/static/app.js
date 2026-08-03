@@ -83,6 +83,7 @@ const elements = {
   imageEmptyText: document.querySelector("#imageEmptyText"),
   imageResumeButton: document.querySelector("#imageResumeButton"),
   imageRegeneration: document.querySelector("#imageRegeneration"),
+  imagePartialResumeButton: document.querySelector("#imagePartialResumeButton"),
   reviewImageButton: document.querySelector("#reviewImageButton"),
   regenerateImageButton: document.querySelector("#regenerateImageButton"),
   promptApproval: document.querySelector("#promptApproval"),
@@ -324,6 +325,7 @@ function bindEvents() {
   elements.regenerateImageButton.addEventListener("click", regenerateImage);
   elements.reviewImageButton.addEventListener("click", reviewImage);
   elements.imageResumeButton.addEventListener("click", resumeImage);
+  elements.imagePartialResumeButton.addEventListener("click", resumeImage);
   elements.newTaskButton.addEventListener("click", requestNewTask);
   elements.downloadButton.addEventListener("click", downloadResult);
   elements.sourceReviewButton.addEventListener("click", () => {
@@ -1425,7 +1427,7 @@ async function generateImage() {
     setInputLocked(true);
     updateSubmitState();
     elements.generateImageButton.disabled = false;
-    elements.generateImageButton.textContent = "确认提示词，一次生成 4 张";
+    elements.generateImageButton.textContent = "确认提示词，双模型生成 4 张";
     showToast(error.message || "无法开始生成结果图。");
     await loadHistory();
   }
@@ -1475,7 +1477,7 @@ async function regenerateImage() {
   if (!jobId || state.runningJobIds.has(jobId)) return;
   if (
     !window.confirm(
-      "将保留当前提示词，创建新的 PixPark 四图任务并替换当前结果图。继续吗？",
+      "将保留当前提示词，重新创建 Nano 4K 与 GPT 2K 两路任务并替换当前结果图。继续吗？",
     )
   ) {
     return;
@@ -1503,7 +1505,7 @@ async function regenerateImage() {
     setInputLocked(true);
     updateSubmitState();
     elements.regenerateImageButton.disabled = false;
-    elements.regenerateImageButton.textContent = "重新生成 4 张结果图";
+    elements.regenerateImageButton.textContent = "双模型重新生成 4 张";
     showToast(error.message || "无法重新生成结果图。");
     await loadHistory();
   }
@@ -1574,7 +1576,7 @@ function renderResult(result, options = {}) {
       ? "提示词待确认"
       : final
         ? "任务结果"
-        : "正在生成 4 张结果图";
+        : "正在由双模型生成 4 张结果图";
   elements.reviewContext.hidden = recoveredImageOnly || !state.previewUrl;
   elements.sourceReviewName.textContent =
     task?.filename || state.selectedFile?.name || "当前需求图";
@@ -1592,7 +1594,7 @@ function renderResult(result, options = {}) {
   const image = result.image || {};
   const requirementAudit = image.requirement_audit || {};
   const generatedUrls = getSafeGeneratedImageUrls(image);
-  renderGeneratedImages(generatedUrls, image.alt);
+  renderGeneratedImages(generatedUrls, image.alt, image.items);
   if (generatedUrls.length) {
     elements.imageEmpty.hidden = true;
     elements.imageResumeButton.hidden = true;
@@ -1612,11 +1614,11 @@ function renderResult(result, options = {}) {
   elements.regeneratePromptButton.disabled = false;
   elements.regeneratePromptButton.textContent = "重新生成创意和提示词";
   elements.generateImageButton.disabled = false;
-  elements.generateImageButton.textContent = "确认提示词，一次生成 4 张";
+  elements.generateImageButton.textContent = "确认提示词，双模型生成 4 张";
   if (promptReady && image.status === "ready") {
     elements.generateImageButton.hidden = false;
     elements.promptApprovalText.textContent =
-      "不满意可重新走完整解析；确认无误后一次生成 4 张。";
+      "不满意可重新走完整解析；确认无误后生成 Nano 4K 两张与 GPT 2K 两张。";
   } else if (promptReady) {
     elements.generateImageButton.hidden = true;
     elements.promptApprovalText.textContent =
@@ -1631,7 +1633,15 @@ function renderResult(result, options = {}) {
     !recoveredImageOnly &&
     generatedUrls.length > 0 &&
     !image.resumable;
-  elements.imageRegeneration.hidden = !canRegenerateImage;
+  const canResumePartial =
+    final && generatedUrls.length > 0 && Boolean(image.resumable);
+  elements.imageRegeneration.hidden = !(canRegenerateImage || canResumePartial);
+  elements.imageRegeneration.querySelector("span").textContent = canResumePartial
+    ? "已保留现有结果；继续查询不会重复提交或扣费。"
+    : "保留当前提示词，重新创建一组结果。";
+  elements.imagePartialResumeButton.hidden = !canResumePartial;
+  elements.imagePartialResumeButton.disabled = false;
+  elements.imagePartialResumeButton.textContent = "继续查询其余结果";
   elements.reviewImageButton.hidden =
     !canRegenerateImage || requirementAudit.status !== "unavailable";
   elements.reviewImageButton.disabled = false;
@@ -1641,7 +1651,7 @@ function renderResult(result, options = {}) {
     canRegenerateImage,
   );
   elements.regenerateImageButton.disabled = false;
-  elements.regenerateImageButton.textContent = "重新生成 4 张结果图";
+  elements.regenerateImageButton.textContent = "双模型重新生成 4 张";
 
   elements.resultTabs.forEach((tab) => {
     tab.hidden = recoveredImageOnly && tab.dataset.resultTab !== "image";
@@ -1669,7 +1679,7 @@ function renderResult(result, options = {}) {
     recoveredImageOnly
       ? "仅恢复到旧版远端图片任务；新的完整任务会在临时保留期内恢复需求图和提示词。"
       : promptReady
-        ? "机械校验与独立语义审查均已通过；先看提示词，确认满意后一次生成 4 张。"
+        ? "机械校验与独立语义审查均已通过；先看提示词，确认满意后由双模型生成 4 张。"
         : final
           ? requirementAudit.pass === false
             ? `图片已保留；PixPark 平台审核通过，但需求符合度复查需修改。`
@@ -1692,21 +1702,21 @@ function renderImageStatus(image) {
   const labels = {
     ready: [
       "等待确认提示词",
-      image.message || "请先查看正向提示词，确认满意后一次生成 4 张结果图。",
+      image.message || "请先查看正向提示词，确认满意后由双模型生成 4 张结果图。",
     ],
-    queued: ["等待生成 4 张结果图", "提示词已通过审查，正在等待 PixPark 四图队列。"],
+    queued: ["等待双模型生成 4 张", "提示词已通过审查，正在等待 Nano 与 GPT 两路队列。"],
     uploading: ["正在上传参考图", image.message || "正在分别上传图1和固定图2。"],
-    creating: ["正在创建四图任务", image.message || "正在创建唯一的 PixPark v3 四图任务。"],
-    polling: ["PixPark 正在生成 4 张", image.message || "正在查询同一个远端四图任务。"],
+    creating: ["正在创建双模型任务", image.message || "正在创建 Nano 4K 与 GPT 2K 两路任务。"],
+    polling: ["双模型正在生成 4 张", image.message || "正在查询两个远端通道任务。"],
     downloading: ["结果已通过审核", image.message || "正在安全下载审核通过的结果图。"],
     partial: ["已返回部分结果", image.message || "已保留审核通过的结果图。"],
-    timeout: ["结果图仍在生成", image.message || "可稍后继续查询同一个远端任务。"],
+    timeout: ["结果图仍在生成", image.message || "可稍后继续查询尚未完成的远端通道。"],
     rejected: ["结果图未通过服务审核", image.message || "提示词结果不受影响。"],
     failed: ["结果图生成失败", image.message || "提示词结果不受影响。"],
     unavailable: ["PixPark 尚未配置", image.message || "提示词仍可正常使用。"],
     incompatible_aspect_ratio: [
       "当前画幅暂不自动生图",
-      image.message || "当前接口固定为 1:1，已保留提示词结果。",
+      image.message || "当前接口固定为 3:4，已保留提示词结果。",
     ],
     disabled: ["结果图生成未启用", image.message || "提示词仍可正常使用。"],
   };
@@ -1735,7 +1745,7 @@ function getSafeGeneratedImageUrls(image) {
   ];
 }
 
-function renderGeneratedImages(urls, alt) {
+function renderGeneratedImages(urls, alt, rawItems) {
   elements.generatedImageGrid.replaceChildren();
   elements.generatedImageGrid.hidden = !urls.length;
   elements.generatedImageGrid.dataset.count = String(urls.length);
@@ -1757,7 +1767,11 @@ function renderGeneratedImages(urls, alt) {
     image.alt = `${alt || "3D 建模参考结果图"} · 方案 ${index + 1}`;
     image.loading = "lazy";
     label.className = "generated-image-index";
-    label.textContent = `方案 ${index + 1}`;
+    const item = Array.isArray(rawItems)
+      ? rawItems.find((candidate) => candidate?.url === url)
+      : null;
+    const model = typeof item?.model === "string" ? item.model.trim() : "";
+    label.textContent = model ? `${model} · 方案 ${index + 1}` : `方案 ${index + 1}`;
     button.append(image, label);
     elements.generatedImageGrid.append(button);
   });
@@ -2010,7 +2024,7 @@ function resetTask(options = {}) {
   elements.reviewImageButton.textContent = "重新复查已有图片";
   elements.generateImageButton.hidden = false;
   elements.generateImageButton.disabled = false;
-  elements.generateImageButton.textContent = "确认提示词，一次生成 4 张";
+  elements.generateImageButton.textContent = "确认提示词，双模型生成 4 张";
   elements.imageEmptyTitle.textContent = "结果图状态";
   elements.imageEmptyText.textContent =
     "提交后将在这里显示生成进度或最终图片。";

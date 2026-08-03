@@ -10,7 +10,7 @@ import shutil
 import tempfile
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
@@ -60,7 +60,7 @@ CLASSIFIER_PROMPT = """
   },
   "anniversary_source": "allowed | forbidden | unknown",
   "allow_aspect_ratio": false,
-  "requested_aspect_ratio": "none | 1:1 | other | unknown",
+  "requested_aspect_ratio": "none | 3:4 | other | unknown",
   "routing_summary": "一句简短中文依据"
 }
 
@@ -75,7 +75,7 @@ CLASSIFIER_PROMPT = """
 - 出现文字、数字、周年、年份、期数、Logo 或徽章时触发 text_logo_time。
 - 出现皓月螺丝小人、螺丝 Logo 或职业服装时触发 haoyue_brand。
 - 用户明确要求画幅比例时 allow_aspect_ratio 为 true。
-- 未要求画幅比例时 requested_aspect_ratio 为 none；明确要求 1:1 时为 1:1；
+- 未要求画幅比例时 requested_aspect_ratio 为 none；明确要求 3:4 时为 3:4；
   明确要求其他比例时为 other；看不清或互相冲突时为 unknown。
 """.strip()
 
@@ -398,9 +398,20 @@ class JobManager:
         )
         self.jobs: dict[str, JobRecord] = self.store.load() if self.store else {}
         self.model_semaphore = asyncio.Semaphore(settings.max_concurrent_jobs)
-        self.image_semaphore = asyncio.Semaphore(
-            settings.max_concurrent_image_jobs
+        self.image_semaphore = (
+            asyncio.Semaphore(settings.max_concurrent_image_jobs)
+            if settings.max_concurrent_image_jobs > 0
+            else None
         )
+
+    async def _with_image_slot(
+        self,
+        operation: Callable[[], Awaitable[PixParkImageResult]],
+    ) -> PixParkImageResult:
+        if self.image_semaphore is None:
+            return await operation()
+        async with self.image_semaphore:
+            return await operation()
 
     def create(
         self,
@@ -514,13 +525,13 @@ class JobManager:
                         record,
                         status="generating_image",
                         step="恢复结果图任务",
-                        message="服务已恢复，正在继续查询原来的 PixPark 任务。",
+                        message="服务已恢复，正在继续查询原来的 PixPark 双通道任务。",
                         error=None,
                     )
                     self._update_image(
                         record,
                         status="polling",
-                        message="正在继续查询原来的 PixPark 任务。",
+                        message="正在继续查询尚未完成的 PixPark 通道任务。",
                         resumable=False,
                     )
                     record.task = asyncio.create_task(self._run_image_resume(record))
@@ -661,13 +672,13 @@ class JobManager:
             record,
             status="generating_image",
             step="继续生成结果图",
-            message="正在继续查询原来的 PixPark 任务，不会重复提交。",
+            message="正在继续查询原来的 PixPark 双通道任务，不会重复提交。",
             error=None,
         )
         self._update_image(
             record,
             status="polling",
-            message="正在继续查询原来的 PixPark 任务。",
+            message="正在继续查询尚未完成的 PixPark 通道任务。",
             resumable=False,
         )
         record.task = asyncio.create_task(self._run_image_resume(record))
@@ -694,13 +705,13 @@ class JobManager:
             record,
             status="generating_image",
             step="生成结果图",
-            message=f"已确认提示词，正在一次生成 {RESULT_IMAGE_COUNT} 张结果图。",
+            message="已确认提示词，正在生成 Nano 4K 两张与 GPT 2K 两张。",
             error=None,
         )
         self._update_image(
             record,
             status="queued",
-            message=f"等待 PixPark {RESULT_IMAGE_COUNT} 张图片队列。",
+            message="等待 Nano 与 GPT 两路图片队列。",
             resumable=False,
         )
         record.task = asyncio.create_task(self._run_image_generation(record))
@@ -756,16 +767,13 @@ class JobManager:
             record,
             status="generating_image",
             step="重新生成结果图",
-            message=(
-                f"保留已确认提示词，正在创建一组新的 "
-                f"{RESULT_IMAGE_COUNT} 张结果图。"
-            ),
+            message="保留已确认提示词，正在创建新的 Nano 4K 与 GPT 2K 双通道任务。",
             error=None,
         )
         self._update_image(
             record,
             status="queued",
-            message=f"等待新的 PixPark {RESULT_IMAGE_COUNT} 张图片队列。",
+            message="等待新的 Nano 与 GPT 两路图片队列。",
             url=None,
             urls=[],
             count=0,
@@ -806,15 +814,19 @@ class JobManager:
         ).discard(job_id)
 
     def _recover_image_record(self, job_id: str) -> JobRecord | None:
+        state_store = PixParkStateStore(
+            self.settings.generated_dir / "pixpark-state"
+        )
         try:
-            state = PixParkStateStore(
-                self.settings.generated_dir / "pixpark-state"
-            ).read(job_id)
+            state = state_store.read(job_id)
         except PixParkError:
             return None
 
-        task_code = str(state.get("taskCode") or "").strip()
-        if not task_code:
+        tasks = state_store.tasks(state)
+        if not any(
+            str(task.get("taskCode") or "").strip()
+            for task in tasks.values()
+        ):
             return None
 
         remote_status = str(state.get("status") or "").strip().lower()
@@ -839,6 +851,20 @@ class JobManager:
             if outputs_are_safe
             else []
         )
+        model_by_name: dict[str, str] = {}
+        for task in tasks.values():
+            label = str(task.get("label") or "PixPark")
+            for name in task.get("outputNames") or []:
+                model_by_name[str(name)] = label
+        image_items = [
+            {
+                "url": f"/generated/{name}",
+                "model": model_by_name.get(name, "PixPark"),
+            }
+            for name in output_names
+            if outputs_are_safe
+        ]
+        resumable = state_store.has_task(job_id)
 
         if remote_status == "rejected":
             image_status = "rejected"
@@ -852,8 +878,12 @@ class JobManager:
             )
             image_message = (
                 f"已从持久化任务状态恢复 {len(image_urls)} 张结果图。"
+                + (
+                    "仍有一个模型通道可继续查询。"
+                    if resumable
+                    else ""
+                )
             )
-            resumable = False
         else:
             image_status = (
                 "timeout"
@@ -862,9 +892,9 @@ class JobManager:
             )
             image_message = (
                 "服务曾中断，但远端任务编号已保存；"
-                "可继续查询同一个 PixPark 任务，不会重复创建。"
+                "可继续查询原来的 PixPark 双通道任务，不会重复创建。"
             )
-            resumable = True
+            resumable = state_store.has_task(job_id)
 
         record = JobRecord(
             id=job_id,
@@ -887,6 +917,7 @@ class JobManager:
                     "status": image_status,
                     "url": image_urls[0] if image_urls else None,
                     "urls": image_urls,
+                    "items": image_items,
                     "count": len(image_urls),
                     "expected_count": RESULT_IMAGE_COUNT,
                     "alt": "恢复查询后的 3D 建模参考结果组图",
@@ -1165,12 +1196,12 @@ class JobManager:
             "disabled": "结果图生成未启用；提示词仍可正常使用。",
             "unavailable": "PixPark 尚未配置；提示词仍可正常使用。",
             "incompatible_aspect_ratio": (
-                "用户要求的画幅不是 1:1，与当前 PixPark 固定接口不兼容，"
+                "用户要求的画幅不是 3:4，与当前双模型固定接口不兼容，"
                 "因此没有自动生图。"
             ),
             "ready": (
                 "提示词已通过审查；请先人工核对，"
-                f"确认后一次生成 {RESULT_IMAGE_COUNT} 张结果图。"
+                "确认后生成 Nano 4K 两张与 GPT 2K 两张。"
             ),
         }
         return messages[status]
@@ -1187,18 +1218,18 @@ class JobManager:
             record,
             status="generating_image",
             step="生成结果图",
-            message=f"提示词已通过审查，正在一次生成 {RESULT_IMAGE_COUNT} 张结果图。",
+            message="提示词已通过审查，正在生成 Nano 4K 两张与 GPT 2K 两张。",
         )
         self._update_image(
             record,
             status="queued",
-            message=f"等待 PixPark {RESULT_IMAGE_COUNT} 张图片队列。",
+            message="等待 Nano 与 GPT 两路图片队列。",
             resumable=False,
         )
         try:
-            async with self.image_semaphore:
-                client = self.pixpark_factory(self.settings)
-                result = await client.generate(
+            client = self.pixpark_factory(self.settings)
+            result = await self._with_image_slot(
+                lambda: client.generate(
                     job_id=record.id,
                     input_filename=record.filename,
                     input_media_type=record.media_type,
@@ -1208,6 +1239,7 @@ class JobManager:
                         record, status, message
                     ),
                 )
+            )
             filenames = self._apply_image_result(record, result)
             await self._review_generated_images(record, filenames)
         except PixParkTimeout as exc:
@@ -1250,14 +1282,15 @@ class JobManager:
 
     async def _run_image_resume(self, record: JobRecord) -> None:
         try:
-            async with self.image_semaphore:
-                client = self.pixpark_factory(self.settings)
-                result = await client.resume(
+            client = self.pixpark_factory(self.settings)
+            result = await self._with_image_slot(
+                lambda: client.resume(
                     job_id=record.id,
                     on_status=lambda status, message: self._image_progress(
                         record, status, message
                     ),
                 )
+            )
             filenames = self._apply_image_result(record, result)
             await self._review_generated_images(record, filenames)
         except asyncio.CancelledError:
@@ -1345,6 +1378,18 @@ class JobManager:
         if not filenames:
             raise PixParkError("PixPark 没有返回可展示的结果图文件。")
         urls = [f"/generated/{name}" for name in filenames]
+        raw_models = getattr(result, "models", ())
+        models = [
+            str(raw_models[index])
+            if index < len(raw_models) and str(raw_models[index]).strip()
+            else "PixPark"
+            for index in range(len(urls))
+        ]
+        items = [
+            {"url": url, "model": models[index]}
+            for index, url in enumerate(urls)
+        ]
+        resumable = bool(getattr(result, "resumable", False))
         count = len(urls)
         status = (
             "completed" if count >= RESULT_IMAGE_COUNT else "partial"
@@ -1354,7 +1399,11 @@ class JobManager:
             if status == "completed"
             else (
                 f"PixPark 本次返回 {count}/{RESULT_IMAGE_COUNT} 张审核通过结果；"
-                "已保留可用图片。"
+                + (
+                    "已保留可用图片，另一通道仍可继续查询。"
+                    if resumable
+                    else "已保留可用图片。"
+                )
             )
         )
         self._update_image(
@@ -1362,10 +1411,11 @@ class JobManager:
             status=status,
             url=urls[0],
             urls=urls,
+            items=items,
             count=count,
             expected_count=RESULT_IMAGE_COUNT,
             message=message,
-            resumable=False,
+            resumable=resumable,
             platform_audit={
                 "status": "passed",
                 "pass": True,
@@ -1503,7 +1553,10 @@ class JobManager:
     def _complete(self, record: JobRecord) -> None:
         image = (record.result or {}).get("image")
         requirement = image.get("requirement_audit") if isinstance(image, dict) else None
-        if isinstance(requirement, dict) and requirement.get("status") == "failed":
+        if isinstance(image, dict) and image.get("resumable"):
+            step = "部分结果已保留"
+            message = "已有结果已保留；另一模型通道仍可继续查询，不会重复提交。"
+        elif isinstance(requirement, dict) and requirement.get("status") == "failed":
             step = "结果图需修改"
             message = "图片已保留；PixPark 平台审核通过，但需求符合度复查未通过。"
         elif isinstance(requirement, dict) and requirement.get("status") == "passed":
@@ -1700,7 +1753,7 @@ def _normalize_classification(value: dict[str, Any]) -> dict[str, Any]:
         "requested_aspect_ratio": (
             value.get("requested_aspect_ratio")
             if value.get("requested_aspect_ratio")
-            in {"none", "1:1", "other", "unknown"}
+            in {"none", "3:4", "other", "unknown"}
             else ("unknown" if value.get("allow_aspect_ratio") else "none")
         ),
         "routing_summary": str(value.get("routing_summary") or ""),

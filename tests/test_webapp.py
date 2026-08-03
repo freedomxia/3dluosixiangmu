@@ -21,7 +21,10 @@ from webapp.parsing import (
 )
 from webapp.pipeline import JobManager, QueueCapacityError, _prepare_audit_image
 from webapp.pixpark_client import (
+    CHANNEL_IMAGE_COUNT,
     FIXED_CONTRACT,
+    GPT_CONTRACT,
+    NANO_CONTRACT,
     RESULT_IMAGE_COUNT,
     PixParkClient,
     PixParkImageResult,
@@ -539,7 +542,7 @@ class FrontendWorkflowTests(unittest.TestCase):
         )
 
         self.assertIn('id="generatedImageGrid"', html)
-        self.assertIn("确认提示词，一次生成 4 张", html)
+        self.assertIn("确认提示词，双模型生成 4 张", html)
         self.assertIn('id="regeneratePromptButton"', html)
         self.assertIn('id="regenerateImageButton"', html)
         self.assertIn('id="reviewImageButton"', html)
@@ -805,6 +808,39 @@ class SkillLoaderTests(unittest.TestCase):
 
 
 class PipelineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_zero_image_limit_allows_unbounded_concurrency(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            style_path = Path(directory) / "style-reference.png"
+            Image.new("RGB", (40, 40), "gray").save(style_path)
+            settings = make_settings(style_path)
+            object.__setattr__(settings, "max_concurrent_image_jobs", 0)
+            manager = JobManager(settings, client=FakeModelClient())
+            active = 0
+            max_active = 0
+            both_entered = asyncio.Event()
+            release = asyncio.Event()
+
+            async def operation() -> PixParkImageResult:
+                nonlocal active, max_active
+                active += 1
+                max_active = max(max_active, active)
+                if active == 2:
+                    both_entered.set()
+                try:
+                    await release.wait()
+                    return PixParkImageResult(task_code="test", filenames=())
+                finally:
+                    active -= 1
+
+            first = asyncio.create_task(manager._with_image_slot(operation))
+            second = asyncio.create_task(manager._with_image_slot(operation))
+            await asyncio.wait_for(both_entered.wait(), timeout=1)
+            release.set()
+            await asyncio.gather(first, second)
+
+            self.assertIsNone(manager.image_semaphore)
+            self.assertEqual(max_active, 2)
+
     async def test_exhausted_semantic_repairs_preserve_audit_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             style_path = Path(directory) / "style-reference.png"
@@ -1378,7 +1414,10 @@ class PixParkContractTests(unittest.IsolatedAsyncioTestCase):
                     super().__init__(configured)
                     self.tool_calls: list[tuple[str, dict]] = []
                     self.uploads: list[dict] = []
-                    self.state_existed_before_poll = False
+                    self.persisted_before_poll: list[str] = []
+                    self.active_creations = 0
+                    self.max_active_creations = 0
+                    self.creation_gate = asyncio.Event()
 
                 async def _initialize(self, client) -> None:
                     return None
@@ -1392,20 +1431,47 @@ class PixParkContractTests(unittest.IsolatedAsyncioTestCase):
 
                 async def _call_tool(self, client, name, arguments):
                     self.tool_calls.append((name, arguments))
-                    return {"taskCode": "task-123", "roundPeriod": 1}
+                    call_number = len(self.tool_calls)
+                    self.active_creations += 1
+                    self.max_active_creations = max(
+                        self.max_active_creations,
+                        self.active_creations,
+                    )
+                    if self.active_creations == 3:
+                        self.creation_gate.set()
+                    try:
+                        await asyncio.wait_for(
+                            self.creation_gate.wait(),
+                            timeout=1,
+                        )
+                        return {
+                            "taskCode": f"task-{call_number}",
+                            "roundPeriod": 1,
+                        }
+                    finally:
+                        self.active_creations -= 1
 
                 async def _poll_and_download(self, client, **kwargs):
-                    self.state_existed_before_poll = (
-                        self.state_store.read(kwargs["job_id"])["taskCode"]
-                        == kwargs["task_code"]
-                    )
-                    return PixParkImageResult(
+                    state = self.state_store.read(kwargs["job_id"])
+                    persisted = self.state_store.tasks(state)[kwargs["channel"]]
+                    if persisted["taskCode"] == kwargs["task_code"]:
+                        self.persisted_before_poll.append(kwargs["channel"])
+                    outputs: list[str] = []
+                    for index in range(1, kwargs["expected_count"] + 1):
+                        slot = kwargs["slot_offset"] + index
+                        output = self.settings.generated_dir / (
+                            f"{kwargs['job_id']}-{slot}.png"
+                        )
+                        Image.new("RGB", (32, 32), "blue").save(output)
+                        outputs.append(output.name)
+                    self.state_store.write_task(
+                        kwargs["job_id"],
+                        channel=kwargs["channel"],
+                        status="completed",
                         task_code=kwargs["task_code"],
-                        filenames=tuple(
-                            f"{kwargs['job_id']}-{index}.png"
-                            for index in range(1, RESULT_IMAGE_COUNT + 1)
-                        ),
+                        output_names=outputs,
                     )
+                    return tuple(outputs)
 
             input_bytes = _make_image_bytes()
             client = CapturingClient(settings)
@@ -1431,22 +1497,45 @@ class PixParkContractTests(unittest.IsolatedAsyncioTestCase):
                 client.uploads[1]["data"],
                 style_path.read_bytes(),
             )
-            name, arguments = client.tool_calls[0]
-            self.assertEqual(name, "imageGenerationUsingPOST")
             self.assertEqual(
-                arguments["imageUrls"],
+                [name for name, _ in client.tool_calls],
                 [
-                    "https://cdn.example.test/input-1.png",
-                    "https://cdn.example.test/input-2.png",
+                    "imageGenerationUsingPOST",
+                    "drawImageUsingPOST",
+                    "drawImageUsingPOST",
                 ],
             )
-            self.assertEqual(arguments["inputPrompt"], "纯净正向提示词")
-            self.assertNotIn("negativePrompt", arguments)
-            self.assertEqual(arguments["imageNum"], RESULT_IMAGE_COUNT)
-            self.assertTrue(client.state_existed_before_poll)
-            self.assertEqual(len(client.tool_calls), 1)
-            for key, value in FIXED_CONTRACT.items():
-                self.assertEqual(arguments[key], value)
+            for _, arguments in client.tool_calls:
+                self.assertEqual(
+                    arguments["imageUrls"],
+                    [
+                        "https://cdn.example.test/input-1.png",
+                        "https://cdn.example.test/input-2.png",
+                    ],
+                )
+                self.assertEqual(arguments["inputPrompt"], "纯净正向提示词")
+                self.assertNotIn("negativePrompt", arguments)
+            self.assertEqual(
+                client.tool_calls[0][1]["imageNum"],
+                CHANNEL_IMAGE_COUNT,
+            )
+            self.assertEqual(client.tool_calls[1][1]["imageNum"], 1)
+            self.assertEqual(client.tool_calls[2][1]["imageNum"], 1)
+            self.assertEqual(client.max_active_creations, 3)
+            nano_arguments = client.tool_calls[0][1]
+            for key, value in NANO_CONTRACT.items():
+                self.assertEqual(nano_arguments[key], value)
+            for _, gpt_arguments in client.tool_calls[1:]:
+                for key, value in GPT_CONTRACT.items():
+                    self.assertEqual(gpt_arguments[key], value)
+            self.assertEqual(
+                sorted(client.persisted_before_poll),
+                ["gpt_1", "gpt_2", "nano"],
+            )
+            state = client.state_store.read("a" * 32)
+            self.assertEqual(state["fixedContract"], FIXED_CONTRACT)
+            self.assertEqual(len(state["taskCodes"]), 3)
+            self.assertEqual(len(state["outputNames"]), RESULT_IMAGE_COUNT)
 
     async def test_resume_queries_same_task_without_recreating(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1464,33 +1553,65 @@ class PixParkContractTests(unittest.IsolatedAsyncioTestCase):
             class ResumeClient(PixParkClient):
                 def __init__(self, configured: Settings) -> None:
                     super().__init__(configured)
-                    self.polled_task_code = ""
+                    self.polled_task_codes: list[str] = []
 
                 async def _initialize(self, client) -> None:
                     return None
 
                 async def _poll_and_download(self, client, **kwargs):
-                    self.polled_task_code = kwargs["task_code"]
-                    return PixParkImageResult(
+                    self.polled_task_codes.append(kwargs["task_code"])
+                    outputs: list[str] = []
+                    for index in range(1, kwargs["expected_count"] + 1):
+                        slot = kwargs["slot_offset"] + index
+                        output = self.settings.generated_dir / (
+                            f"{kwargs['job_id']}-{slot}.png"
+                        )
+                        Image.new("RGB", (32, 32), "teal").save(output)
+                        outputs.append(output.name)
+                    self.state_store.write_task(
+                        kwargs["job_id"],
+                        channel=kwargs["channel"],
+                        status="completed",
                         task_code=kwargs["task_code"],
-                        filenames=tuple(
-                            f"{kwargs['job_id']}-{index}.png"
-                            for index in range(1, RESULT_IMAGE_COUNT + 1)
-                        ),
+                        output_names=outputs,
                     )
+                    return tuple(outputs)
 
             client = ResumeClient(settings)
-            client.state_store.write(
-                "c" * 32,
+            job_id = "c" * 32
+            client.state_store.write_task(
+                job_id,
+                channel="nano",
                 status="timeout",
-                task_code="existing-remote-task",
+                task_code="existing-nano-task",
+            )
+            client.state_store.write_task(
+                job_id,
+                channel="gpt_1",
+                status="timeout",
+                task_code="existing-gpt-task-1",
+            )
+            client.state_store.write_task(
+                job_id,
+                channel="gpt_2",
+                status="timeout",
+                task_code="existing-gpt-task-2",
             )
             result = await client.resume(
-                job_id="c" * 32,
+                job_id=job_id,
                 on_status=lambda *_: None,
             )
-            self.assertEqual(client.polled_task_code, "existing-remote-task")
-            self.assertEqual(result.task_code, "existing-remote-task")
+            self.assertEqual(
+                sorted(client.polled_task_codes),
+                [
+                    "existing-gpt-task-1",
+                    "existing-gpt-task-2",
+                    "existing-nano-task",
+                ],
+            )
+            self.assertEqual(result.task_code, "existing-nano-task")
+            self.assertEqual(len(result.task_codes), 3)
+            self.assertEqual(len(result.filenames), RESULT_IMAGE_COUNT)
 
     async def test_job_manager_recovers_remote_image_after_restart(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1680,6 +1801,104 @@ class PixParkContractTests(unittest.IsolatedAsyncioTestCase):
             state = client.state_store.read(job_id)
             self.assertEqual(state["status"], "completed")
             self.assertEqual(state["outputNames"], list(result.filenames))
+
+    async def test_resume_only_polls_unfinished_hybrid_channel(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            style_path = root / "style-reference.png"
+            generated_dir = root / "generated"
+            generated_dir.mkdir()
+            Image.new("RGB", (40, 40), "gray").save(style_path)
+            settings = make_settings(
+                style_path,
+                generated_dir=generated_dir,
+                image_generation_enabled=True,
+            )
+            job_id = "8" * 32
+
+            class PartialResumeClient(PixParkClient):
+                def __init__(self, configured: Settings) -> None:
+                    super().__init__(configured)
+                    self.polled_channels: list[str] = []
+
+                async def _initialize(self, client) -> None:
+                    return None
+
+                async def _poll_and_download(self, client, **kwargs):
+                    self.polled_channels.append(kwargs["channel"])
+                    outputs: list[str] = []
+                    for index in range(1, kwargs["expected_count"] + 1):
+                        slot = kwargs["slot_offset"] + index
+                        output = self.settings.generated_dir / f"{job_id}-{slot}.png"
+                        Image.new("RGB", (32, 32), "orange").save(output)
+                        outputs.append(output.name)
+                    self.state_store.write_task(
+                        job_id,
+                        channel=kwargs["channel"],
+                        status="completed",
+                        task_code=kwargs["task_code"],
+                        output_names=outputs,
+                    )
+                    return tuple(outputs)
+
+            client = PartialResumeClient(settings)
+            nano_outputs: list[str] = []
+            for slot in (1, 2):
+                output = generated_dir / f"{job_id}-{slot}.png"
+                Image.new("RGB", (32, 32), "purple").save(output)
+                nano_outputs.append(output.name)
+            client.state_store.write_task(
+                job_id,
+                channel="nano",
+                status="completed",
+                task_code="finished-nano-task",
+                output_names=nano_outputs,
+            )
+            client.state_store.write_task(
+                job_id,
+                channel="gpt_1",
+                status="completed",
+                task_code="finished-gpt-task",
+                output_names=[f"{job_id}-3.png"],
+            )
+            Image.new("RGB", (32, 32), "gold").save(
+                generated_dir / f"{job_id}-3.png"
+            )
+            client.state_store.write_task(
+                job_id,
+                channel="gpt_2",
+                status="timeout",
+                task_code="pending-gpt-task-2",
+            )
+
+            partial = client._result_from_state(job_id)
+            self.assertEqual(len(partial.filenames), 3)
+            self.assertTrue(partial.resumable)
+            self.assertEqual(
+                partial.models,
+                (
+                    "Nano Banana · 4K",
+                    "Nano Banana · 4K",
+                    "GPT · 2K",
+                ),
+            )
+
+            completed = await client.resume(
+                job_id=job_id,
+                on_status=lambda *_: None,
+            )
+            self.assertEqual(client.polled_channels, ["gpt_2"])
+            self.assertEqual(len(completed.filenames), RESULT_IMAGE_COUNT)
+            self.assertFalse(completed.resumable)
+            self.assertEqual(
+                completed.models,
+                (
+                    "Nano Banana · 4K",
+                    "Nano Banana · 4K",
+                    "GPT · 2K",
+                    "GPT · 2K",
+                ),
+            )
 
     async def test_state_file_excludes_credentials_and_signed_urls(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

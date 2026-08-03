@@ -18,13 +18,42 @@ from PIL import Image, UnidentifiedImageError
 from webapp.config import Settings
 
 RESULT_IMAGE_COUNT = 4
-FIXED_CONTRACT = {
+CHANNEL_IMAGE_COUNT = 2
+NANO_CONTRACT = {
     "version": 3,
-    "imageScale": "1:1",
+    "imageScale": "3:4",
     "resolution": "4K",
-    "imageNum": RESULT_IMAGE_COUNT,
+    "imageNum": CHANNEL_IMAGE_COUNT,
     "enableGoogleSearch": False,
 }
+GPT_CONTRACT = {
+    "version": 2,
+    "imageScale": "768x1024",
+    "quality": 2,
+    "imageNum": 1,
+    "background": "auto",
+}
+FIXED_CONTRACT = {
+    "nano": NANO_CONTRACT,
+    "gpt": {**GPT_CONTRACT, "taskCount": 2},
+}
+CHANNEL_ORDER = ("nano", "gpt_1", "gpt_2")
+STATE_CHANNEL_ORDER = (*CHANNEL_ORDER, "gpt", "legacy")
+CHANNEL_EXPECTED_COUNTS = {
+    "nano": 2,
+    "gpt_1": 1,
+    "gpt_2": 1,
+    "gpt": 1,
+    "legacy": 4,
+}
+CHANNEL_LABELS = {
+    "nano": "Nano Banana · 4K",
+    "gpt_1": "GPT · 2K",
+    "gpt_2": "GPT · 2K",
+    "gpt": "GPT · 2K",
+    "legacy": "PixPark 旧任务",
+}
+CHANNEL_OFFSETS = {"nano": 0, "gpt_1": 2, "gpt_2": 3, "gpt": 2, "legacy": 0}
 ALLOWED_IMAGE_TYPES = {
     "image/png": ".png",
     "image/jpeg": ".jpg",
@@ -51,6 +80,9 @@ class PixParkRejected(PixParkError):
 class PixParkImageResult:
     task_code: str
     filenames: tuple[str, ...]
+    task_codes: tuple[str, ...] = ()
+    models: tuple[str, ...] = ()
+    resumable: bool = False
 
     @property
     def filename(self) -> str:
@@ -84,7 +116,47 @@ class PixParkStateStore:
             value = self.read(job_id)
         except PixParkError:
             return False
-        return bool(str(value.get("taskCode") or "").strip())
+        return any(
+            str(task.get("taskCode") or "").strip()
+            and str(task.get("status") or "").lower()
+            in {"created", "polling", "timeout"}
+            for task in self.tasks(value).values()
+        )
+
+    def tasks(self, value: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        raw_tasks = value.get("tasks")
+        if isinstance(raw_tasks, dict):
+            tasks = {
+                str(channel): task
+                for channel, task in raw_tasks.items()
+                if isinstance(task, dict)
+            }
+            if "gpt" in tasks and "gpt_1" not in tasks:
+                tasks["gpt_1"] = tasks.pop("gpt")
+            return tasks
+
+        legacy_code = str(value.get("taskCode") or "").strip()
+        if not legacy_code:
+            return {}
+        raw_names = value.get("outputNames")
+        if isinstance(raw_names, list):
+            output_names = [
+                str(name).strip() for name in raw_names if str(name).strip()
+            ]
+        else:
+            legacy_name = str(value.get("outputName") or "").strip()
+            output_names = [legacy_name] if legacy_name else []
+        return {
+            "legacy": {
+                "status": str(value.get("status") or ""),
+                "taskCode": legacy_code,
+                "taskStatus": value.get("taskStatus"),
+                "outputNames": output_names,
+                "expectedCount": RESULT_IMAGE_COUNT,
+                "label": CHANNEL_LABELS["legacy"],
+                "error": value.get("error"),
+            }
+        }
 
     def discard(self, job_id: str) -> None:
         """Forget a previous remote task before starting a fresh image batch."""
@@ -105,7 +177,6 @@ class PixParkStateStore:
         output_names: list[str] | tuple[str, ...] | None = None,
         error: str | None = None,
     ) -> None:
-        path = self.path_for(job_id)
         normalized_names = [
             str(name).strip()
             for name in (output_names or ())
@@ -124,6 +195,135 @@ class PixParkStateStore:
             "fixedContract": FIXED_CONTRACT,
             "updatedAt": int(time.time()),
         }
+        self._persist(job_id, payload)
+
+    def write_task(
+        self,
+        job_id: str,
+        *,
+        channel: str,
+        status: str,
+        task_code: str,
+        task_status: Any = None,
+        output_names: list[str] | tuple[str, ...] | None = None,
+        error: str | None = None,
+    ) -> None:
+        try:
+            payload = self.read(job_id)
+        except PixParkError:
+            payload = {
+                "schemaVersion": 2,
+                "jobId": job_id,
+                "tasks": {},
+            }
+
+        raw_tasks = payload.get("tasks")
+        if not isinstance(raw_tasks, dict):
+            raw_tasks = {}
+            legacy = self.tasks(payload).get("legacy")
+            if legacy is not None:
+                raw_tasks["legacy"] = legacy
+        tasks = {
+            str(name): dict(value)
+            for name, value in raw_tasks.items()
+            if isinstance(value, dict)
+        }
+        if "gpt" in tasks and "gpt_1" not in tasks:
+            tasks["gpt_1"] = tasks.pop("gpt")
+        previous = tasks.get(channel, {})
+        normalized_names = (
+            [
+                str(name).strip()
+                for name in output_names
+                if str(name).strip()
+            ]
+            if output_names is not None
+            else list(previous.get("outputNames") or [])
+        )
+        contract = (
+            NANO_CONTRACT
+            if channel == "nano"
+            else GPT_CONTRACT
+            if channel.startswith("gpt")
+            else previous.get("contract")
+        )
+        tasks[channel] = {
+            "status": status,
+            "taskCode": str(task_code or previous.get("taskCode") or "").strip(),
+            "taskStatus": task_status,
+            "outputNames": normalized_names,
+            "expectedCount": (
+                CHANNEL_EXPECTED_COUNTS.get(channel, RESULT_IMAGE_COUNT)
+            ),
+            "label": CHANNEL_LABELS.get(channel, channel),
+            "contract": contract,
+            "error": _safe_error(error),
+        }
+        payload = {
+            "schemaVersion": 2,
+            "jobId": job_id,
+            "tasks": tasks,
+            "fixedContract": FIXED_CONTRACT,
+            "updatedAt": int(time.time()),
+        }
+        self._refresh_summary(payload)
+        self._persist(job_id, payload)
+
+    @staticmethod
+    def _refresh_summary(payload: dict[str, Any]) -> None:
+        tasks = payload.get("tasks")
+        if not isinstance(tasks, dict):
+            tasks = {}
+        ordered_channels = [
+            channel for channel in STATE_CHANNEL_ORDER if channel in tasks
+        ] + [
+            str(channel)
+            for channel in tasks
+            if channel not in set(STATE_CHANNEL_ORDER)
+        ]
+        output_names: list[str] = []
+        task_codes: dict[str, str] = {}
+        statuses: list[str] = []
+        errors: list[str] = []
+        for channel in ordered_channels:
+            task = tasks[channel]
+            if not isinstance(task, dict):
+                continue
+            status = str(task.get("status") or "").lower()
+            if status:
+                statuses.append(status)
+            code = str(task.get("taskCode") or "").strip()
+            if code:
+                task_codes[channel] = code
+            for name in task.get("outputNames") or []:
+                normalized = str(name).strip()
+                if normalized and normalized not in output_names:
+                    output_names.append(normalized)
+            error = str(task.get("error") or "").strip()
+            if error:
+                errors.append(error)
+
+        active = {"created", "polling", "timeout"}
+        if len(output_names) >= RESULT_IMAGE_COUNT:
+            aggregate_status = "completed"
+        elif any(status in active for status in statuses):
+            aggregate_status = "timeout" if "timeout" in statuses else "polling"
+        elif output_names:
+            aggregate_status = "partial"
+        elif statuses and all(status == "rejected" for status in statuses):
+            aggregate_status = "rejected"
+        else:
+            aggregate_status = "failed"
+
+        payload["status"] = aggregate_status
+        payload["taskCodes"] = task_codes
+        payload["taskCode"] = next(iter(task_codes.values()), "")
+        payload["outputNames"] = output_names
+        payload["outputName"] = output_names[0] if output_names else None
+        payload["error"] = _safe_error("；".join(errors) if errors else None)
+
+    def _persist(self, job_id: str, payload: dict[str, Any]) -> None:
+        path = self.path_for(job_id)
         temporary = path.with_suffix(".json.tmp")
         try:
             temporary.write_text(
@@ -192,39 +392,113 @@ class PixParkClient:
                 media_type=style_media_type,
                 data=style_data,
             )
+            references = [requirement_url, style_url]
+            specifications = (
+                (
+                    "nano",
+                    "imageGenerationUsingPOST",
+                    NANO_CONTRACT,
+                ),
+                (
+                    "gpt_1",
+                    "drawImageUsingPOST",
+                    GPT_CONTRACT,
+                ),
+                (
+                    "gpt_2",
+                    "drawImageUsingPOST",
+                    GPT_CONTRACT,
+                ),
+            )
 
-            on_status(
-                "creating",
-                f"正在创建唯一的 PixPark v3 四图任务（{RESULT_IMAGE_COUNT} 张）。",
-            )
-            created = await self._call_tool(
-                client,
-                "imageGenerationUsingPOST",
-                {
-                    "imageUrls": [requirement_url, style_url],
-                    "inputPrompt": prompt,
-                    **FIXED_CONTRACT,
-                },
-            )
-            task_code = str(created.get("taskCode") or "").strip()
-            if not task_code:
-                raise PixParkError("PixPark 创建结果缺少 taskCode。")
+            async def create_remote_task(
+                channel: str,
+                tool_name: str,
+                contract: dict[str, Any],
+            ) -> tuple[str, str, float] | PixParkError:
+                on_status(
+                    "creating",
+                    f"正在创建 {CHANNEL_LABELS[channel]} 生图任务。",
+                )
+                try:
+                    created = await self._call_tool(
+                        client,
+                        tool_name,
+                        {
+                            "imageUrls": references,
+                            "inputPrompt": prompt,
+                            **contract,
+                        },
+                    )
+                    task_code = str(created.get("taskCode") or "").strip()
+                    if not task_code:
+                        raise PixParkError(
+                            f"{CHANNEL_LABELS[channel]} 创建结果缺少 taskCode。"
+                        )
+                except PixParkError as exc:
+                    self.state_store.write_task(
+                        job_id,
+                        channel=channel,
+                        status="failed",
+                        task_code="",
+                        error=str(exc),
+                    )
+                    return exc
+                except Exception:
+                    error = PixParkError(
+                        f"{CHANNEL_LABELS[channel]} 创建任务时发生未预期错误。"
+                    )
+                    self.state_store.write_task(
+                        job_id,
+                        channel=channel,
+                        status="failed",
+                        task_code="",
+                        error=str(error),
+                    )
+                    return error
 
-            self.state_store.write(
-                job_id,
-                status="created",
-                task_code=task_code,
+                self.state_store.write_task(
+                    job_id,
+                    channel=channel,
+                    status="created",
+                    task_code=task_code,
+                )
+                return (
+                    channel,
+                    task_code,
+                    _positive_float(
+                        created.get("roundPeriod"),
+                        self.settings.pixpark_poll_interval_seconds,
+                    ),
+                )
+
+            creation_results = await asyncio.gather(
+                *(
+                    create_remote_task(channel, tool_name, contract)
+                    for channel, tool_name, contract in specifications
+                )
             )
-            interval = _positive_float(
-                created.get("roundPeriod"),
-                self.settings.pixpark_poll_interval_seconds,
-            )
-            return await self._poll_and_download(
+            pending = [
+                result
+                for result in creation_results
+                if isinstance(result, tuple)
+            ]
+            creation_errors = [
+                result
+                for result in creation_results
+                if isinstance(result, PixParkError)
+            ]
+
+            if not pending:
+                raise creation_errors[0] if creation_errors else PixParkError(
+                    "PixPark 没有创建任何远端图片任务。"
+                )
+            return await self._poll_channels(
                 client,
                 job_id=job_id,
-                task_code=task_code,
-                interval=interval,
+                pending=pending,
                 on_status=on_status,
+                prior_errors=creation_errors,
             )
 
     async def resume(
@@ -236,21 +510,136 @@ class PixParkClient:
         if not self.settings.pixpark_configured:
             raise PixParkError("PixPark Token 尚未配置。")
         state = self.state_store.read(job_id)
-        task_code = str(state.get("taskCode") or "").strip()
-        if not task_code:
+        tasks = self.state_store.tasks(state)
+        if not tasks:
             raise PixParkError("状态文件中没有可恢复的 taskCode。")
 
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(self.settings.pixpark_timeout_seconds)
         ) as client:
             await self._initialize(client)
-            return await self._poll_and_download(
+            pending: list[tuple[str, str, float]] = []
+            for channel, task in tasks.items():
+                task_code = str(task.get("taskCode") or "").strip()
+                if not task_code:
+                    continue
+                output_names = self._existing_outputs(task.get("outputNames"))
+                status = str(task.get("status") or "").lower()
+                if output_names and status in {"completed", "partial"}:
+                    continue
+                if status == "rejected":
+                    continue
+                pending.append(
+                    (
+                        channel,
+                        task_code,
+                        self.settings.pixpark_poll_interval_seconds,
+                    )
+                )
+            if not pending:
+                result = self._result_from_state(job_id)
+                if result.filenames:
+                    return result
+                raise PixParkError("状态文件中没有仍可查询的远端任务。")
+            return await self._poll_channels(
                 client,
                 job_id=job_id,
-                task_code=task_code,
-                interval=self.settings.pixpark_poll_interval_seconds,
+                pending=pending,
                 on_status=on_status,
             )
+
+    async def _poll_channels(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        job_id: str,
+        pending: list[tuple[str, str, float]],
+        on_status: StatusCallback,
+        prior_errors: list[PixParkError] | None = None,
+    ) -> PixParkImageResult:
+        responses = await asyncio.gather(
+            *(
+                self._poll_and_download(
+                    client,
+                    job_id=job_id,
+                    channel=channel,
+                    task_code=task_code,
+                    interval=interval,
+                    expected_count=(
+                        CHANNEL_EXPECTED_COUNTS.get(channel, RESULT_IMAGE_COUNT)
+                    ),
+                    slot_offset=CHANNEL_OFFSETS.get(channel, 0),
+                    on_status=on_status,
+                )
+                for channel, task_code, interval in pending
+            ),
+            return_exceptions=True,
+        )
+        errors = list(prior_errors or []) + [
+            response
+            for response in responses
+            if isinstance(response, PixParkError)
+        ]
+        result = self._result_from_state(job_id)
+        if result.filenames:
+            return result
+        timeout = next(
+            (error for error in errors if isinstance(error, PixParkTimeout)),
+            None,
+        )
+        if timeout is not None:
+            raise timeout
+        rejected = next(
+            (error for error in errors if isinstance(error, PixParkRejected)),
+            None,
+        )
+        if rejected is not None:
+            raise rejected
+        if errors:
+            raise errors[0]
+        raise PixParkError("PixPark 没有返回可展示的结果图文件。")
+
+    def _result_from_state(self, job_id: str) -> PixParkImageResult:
+        state = self.state_store.read(job_id)
+        tasks = self.state_store.tasks(state)
+        ordered_channels = [
+            channel for channel in STATE_CHANNEL_ORDER if channel in tasks
+        ]
+        filenames: list[str] = []
+        models: list[str] = []
+        task_codes: list[str] = []
+        for channel in ordered_channels:
+            task = tasks[channel]
+            code = str(task.get("taskCode") or "").strip()
+            if code:
+                task_codes.append(code)
+            for filename in self._existing_outputs(task.get("outputNames")):
+                if filename in filenames:
+                    continue
+                filenames.append(filename)
+                models.append(str(task.get("label") or CHANNEL_LABELS[channel]))
+        return PixParkImageResult(
+            task_code=task_codes[0] if task_codes else "",
+            task_codes=tuple(task_codes),
+            filenames=tuple(filenames[:RESULT_IMAGE_COUNT]),
+            models=tuple(models[:RESULT_IMAGE_COUNT]),
+            resumable=self.state_store.has_task(job_id),
+        )
+
+    def _existing_outputs(self, raw_names: Any) -> tuple[str, ...]:
+        if not isinstance(raw_names, list):
+            return ()
+        result: list[str] = []
+        for raw_name in raw_names:
+            name = str(raw_name).strip()
+            if (
+                name
+                and Path(name).name == name
+                and Path(name).suffix.lower() in {".png", ".jpg", ".webp"}
+                and (self.settings.generated_dir / name).is_file()
+            ):
+                result.append(name)
+        return tuple(result)
 
     async def _initialize(self, client: httpx.AsyncClient) -> None:
         self._session_id = None
@@ -337,16 +726,20 @@ class PixParkClient:
         client: httpx.AsyncClient,
         *,
         job_id: str,
+        channel: str,
         task_code: str,
         interval: float,
+        expected_count: int,
+        slot_offset: int,
         on_status: StatusCallback,
-    ) -> PixParkImageResult:
+    ) -> tuple[str, ...]:
         deadline = time.monotonic() + self.settings.pixpark_max_wait_seconds
         interval = max(interval, 1.0)
+        label = CHANNEL_LABELS.get(channel, channel)
         while time.monotonic() < deadline:
             on_status(
                 "polling",
-                f"PixPark 正在生成 {RESULT_IMAGE_COUNT} 张结果图。",
+                f"{label} 正在生成 {expected_count} 张结果图。",
             )
             data = await self._call_tool(
                 client,
@@ -354,8 +747,9 @@ class PixParkClient:
                 {"taskCode": task_code},
             )
             task_status = data.get("taskStatus")
-            self.state_store.write(
+            self.state_store.write_task(
                 job_id,
+                channel=channel,
                 status="polling",
                 task_code=task_code,
                 task_status=task_status,
@@ -371,36 +765,37 @@ class PixParkClient:
                     if isinstance(item, dict)
                     and item.get("imageAuditStatus") is True
                     and str(item.get("targetImageUrl") or "").strip()
-                ][:RESULT_IMAGE_COUNT]
+                ][:expected_count]
                 if not approved_urls:
-                    self.state_store.write(
+                    self.state_store.write_task(
                         job_id,
+                        channel=channel,
                         status="rejected",
                         task_code=task_code,
                         task_status=task_status,
-                        error="任务完成但没有审核通过的结果图。",
+                        error=f"{label} 完成但没有审核通过的结果图。",
                     )
-                    raise PixParkRejected("PixPark 没有返回审核通过的结果图。")
+                    raise PixParkRejected(f"{label} 没有返回审核通过的结果图。")
 
                 for approved_url in approved_urls:
                     _require_public_url(approved_url, "结果图地址")
                 on_status(
                     "downloading",
-                    f"{len(approved_urls)} 张结果已通过审核，正在下载。",
+                    f"{label} 的 {len(approved_urls)} 张结果已通过审核，正在下载。",
                 )
                 filenames: list[str] = []
                 try:
                     for index, approved_url in enumerate(approved_urls, start=1):
                         on_status(
                             "downloading",
-                            f"正在下载第 {index}/{len(approved_urls)} 张结果图。",
+                            f"正在下载 {label} 第 {index}/{len(approved_urls)} 张结果图。",
                         )
                         filenames.append(
                             await self._download_result(
                                 client,
                                 job_id=job_id,
                                 url=approved_url,
-                                slot=index,
+                                slot=slot_offset + index,
                             )
                         )
                 except Exception:
@@ -413,36 +808,36 @@ class PixParkClient:
                             pass
                     raise
 
-                self.state_store.write(
+                self.state_store.write_task(
                     job_id,
+                    channel=channel,
                     status="completed",
                     task_code=task_code,
                     task_status=task_status,
                     output_names=filenames,
                 )
-                return PixParkImageResult(
-                    task_code=task_code,
-                    filenames=tuple(filenames),
-                )
+                return tuple(filenames)
 
             if _contains_rejection(data):
-                self.state_store.write(
+                self.state_store.write_task(
                     job_id,
+                    channel=channel,
                     status="rejected",
                     task_code=task_code,
                     task_status=task_status,
-                    error="PixPark 明确拒绝或终止任务。",
+                    error=f"{label} 明确拒绝或终止任务。",
                 )
-                raise PixParkRejected("PixPark 明确拒绝或终止了本次任务。")
+                raise PixParkRejected(f"{label} 明确拒绝或终止了本次任务。")
             await asyncio.sleep(interval)
 
-        self.state_store.write(
+        self.state_store.write_task(
             job_id,
+            channel=channel,
             status="timeout",
             task_code=task_code,
-            error="超过本次等待时间，可继续查询同一任务。",
+            error=f"{label} 超过本次等待时间，可继续查询同一任务。",
         )
-        raise PixParkTimeout("结果图仍在生成，可稍后继续查询同一任务。")
+        raise PixParkTimeout(f"{label} 仍在生成，可稍后继续查询同一任务。")
 
     async def _download_result(
         self,

@@ -233,7 +233,7 @@ def load_settings() -> Settings:
             os.getenv("IMAGE_GENERATION_ENABLED"), default=False
         ),
         max_concurrent_image_jobs=_as_int(
-            "MAX_CONCURRENT_IMAGE_JOBS", 1, minimum=1, maximum=8
+            "MAX_CONCURRENT_IMAGE_JOBS", 0, minimum=0, maximum=1000
         ),
         pixpark_endpoint=os.getenv(
             "PIX_PARK_ENDPOINT",

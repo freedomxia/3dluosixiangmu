@@ -15,8 +15,8 @@ FORM: Vertical production line, selected as option B by the user; completed outp
       content="上传一张皓月项目需求图，自动生成并校验 3D 建模参考提示词。"
     />
     <title>皓月 3D 需求解析</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260802-1" />
-    <script src="/static/app.js?v=20260802-1" defer></script>
+    <link rel="stylesheet" href="/static/styles.css?v=20260803-1" />
+    <script src="/static/app.js?v=20260803-1" defer></script>
   </head>
   <body data-mode="idle">
     <div class="app-frame">
@@ -158,7 +158,7 @@ FORM: Vertical production line, selected as option B by the user; completed outp
             <legend>
               <span>02</span>
               <strong>结果图生成</strong>
-              <small>PixPark v3 · Token 仅交给本机后端</small>
+              <small>PixPark Nano + GPT · Token 仅交给本机后端</small>
             </legend>
 
             <div class="pixpark-config-line">
@@ -521,6 +521,14 @@ FORM: Vertical production line, selected as option B by the user; completed outp
                   <span>保留当前提示词，重新创建一组结果。</span>
                   <button
                     class="secondary-button"
+                    id="imagePartialResumeButton"
+                    type="button"
+                    hidden
+                  >
+                    继续查询其余结果
+                  </button>
+                  <button
+                    class="secondary-button"
                     id="reviewImageButton"
                     type="button"
                     hidden
@@ -532,7 +540,7 @@ FORM: Vertical production line, selected as option B by the user; completed outp
                     id="regenerateImageButton"
                     type="button"
                   >
-                    重新生成 4 张结果图
+                    双模型重新生成 4 张
                   </button>
                 </div>
                 <figcaption id="imageCaption">结果图 · 与本任务提示词保持同一上下文</figcaption>
@@ -585,7 +593,7 @@ FORM: Vertical production line, selected as option B by the user; completed outp
                       id="generateImageButton"
                       type="button"
                     >
-                      确认提示词，一次生成 4 张
+                      确认提示词，双模型生成 4 张
                     </button>
                   </div>
                 </div>
